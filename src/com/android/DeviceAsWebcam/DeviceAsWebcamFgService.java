@@ -24,6 +24,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
 import android.os.Binder;
@@ -109,7 +110,7 @@ public class DeviceAsWebcamFgService extends Service {
                 NotificationManager.IMPORTANCE_DEFAULT).setCategory(
                 Notification.CATEGORY_SERVICE).setContentIntent(pendingIntent).setSmallIcon(
                 R.drawable.ic_root_webcam).build();
-        startForeground(/* id= */ 1, notif);
+        startForeground(/* id= */ 1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA);
     }
 
     private int setupServicesAndStartListening() {
@@ -197,6 +198,74 @@ public class DeviceAsWebcamFgService extends Service {
         }
     }
 
+    /**
+     * Returns the {@link CameraInfo} of the working camera.
+     */
+    public CameraInfo getCameraInfo() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "getCameraInfo called after Service was destroyed.");
+                return null;
+            }
+            return mCameraController.getCameraInfo();
+        }
+    }
+
+    /**
+     * Sets the new zoom ratio setting to the working camera.
+     */
+    public void setZoomRatio(float zoomRatio) {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "setZoomRatio called after Service was destroyed.");
+                return;
+            }
+            mCameraController.setZoomRatio(zoomRatio);
+        }
+    }
+
+    /**
+     * Returns current zoom ratio setting.
+     */
+    public float getZoomRatio() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "getZoomRatio called after Service was destroyed.");
+                return 1.0f;
+            }
+            return mCameraController.getZoomRatio();
+        }
+    }
+
+    /**
+     * Returns whether the device can support toggle camera function.
+     *
+     * @return {@code true} if the device has both back and front cameras. Otherwise, returns
+     * {@code false}.
+     */
+    public boolean canToggleCamera() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "canToggleCamera called after Service was destroyed.");
+                return false;
+            }
+            return mCameraController.canToggleCamera();
+        }
+    }
+
+    /**
+     * Toggles camera between the back and front cameras.
+     */
+    public void toggleCamera() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "toggleCamera called after Service was destroyed.");
+                return;
+            }
+            mCameraController.toggleCamera();
+        }
+    }
+
     @UsedByNative("DeviceAsWebcamNative.cpp")
     private void startStreaming() {
         synchronized (mServiceLock) {
@@ -274,7 +343,7 @@ public class DeviceAsWebcamFgService extends Service {
      * @param timestamp timestamp associated with the buffer which uniquely identifies the buffer
      * @return 0 if buffer was successfully queued for encoding. non-0 otherwise.
      */
-    public native int nativeEncodeImage(HardwareBuffer buffer, long timestamp);
+    public native int nativeEncodeImage(HardwareBuffer buffer, long timestamp, int rotation);
 
     /**
      * Called by {@link #onDestroy} to give the JNI code a chance to clean up before the service

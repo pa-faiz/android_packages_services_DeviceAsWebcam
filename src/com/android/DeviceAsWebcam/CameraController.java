@@ -21,8 +21,10 @@ import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
@@ -40,11 +42,12 @@ import androidx.annotation.NonNull;
 import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * This class controls the operation of the camera - primarily through the public calls
@@ -70,6 +73,9 @@ public class CameraController {
 
     private static final int MAX_BUFFERS = 4;
 
+    private String mBackCameraId = null;
+    private String mFrontCameraId = null;
+
     private ImageReader mImgReader;
     private int mCurrentState = NO_STREAMING;
     private Context mContext;
@@ -77,9 +83,9 @@ public class CameraController {
     private CaptureRequest.Builder mPreviewRequestBuilder;
     private CameraManager mCameraManager;
     private CameraDevice mCameraDevice;
-    private HandlerThread mImageReaderThread;
     private Handler mImageReaderHandler;
-    private ThreadPoolExecutor mThreadPoolExecutor;
+    private Executor mCameraCallbacksExecutor;
+    private Executor mServiceEventsExecutor;
     private Surface mPreviewSurface;
     private OutputConfiguration mPreviewOutputConfiguration;
     private OutputConfiguration mWebcamOutputConfiguration;
@@ -93,7 +99,7 @@ public class CameraController {
     private ConcurrentHashMap<Long, ImageAndBuffer> mImageMap = new ConcurrentHashMap<>();
     private int mFps;
     // TODO(b/267794640): UI to select camera id
-    private String mCameraId = "0"; // Default camera id.
+    private String mCameraId = null;
 
     private CameraDevice.StateCallback mCameraStateCallback = new CameraDevice.StateCallback() {
         @Override
@@ -127,17 +133,18 @@ public class CameraController {
                     mCaptureSession = cameraCaptureSession;
                     try {
                             mCaptureSession.setSingleRepeatingRequest(
-                                    mPreviewRequestBuilder.build(), mThreadPoolExecutor,
+                                    mPreviewRequestBuilder.build(), mCameraCallbacksExecutor,
                                     mCaptureCallback);
 
                     } catch (CameraAccessException e) {
-                        e.printStackTrace();
+                        Log.e(TAG, "setSingleRepeatingRequest failed", e);
                     }
                     mCaptureSessionReady.open();
                 }
 
                 @Override
                 public void onConfigureFailed(@NonNull CameraCaptureSession captureSession) {
+                    Log.e(TAG, "Failed to configure CameraCaptureSession");
                 }
             };
 
@@ -171,8 +178,8 @@ public class CameraController {
                     HardwareBuffer hardwareBuffer = image.getHardwareBuffer();
                     mImageMap.put(ts, new ImageAndBuffer(image, hardwareBuffer));
                     // Callback into DeviceAsWebcamFgService to encode image
-                    if ((!mStartCaptureWebcamStream.get()) ||
-                            (service.nativeEncodeImage(hardwareBuffer, ts) != 0)) {
+                    if ((!mStartCaptureWebcamStream.get()) || (service.nativeEncodeImage(
+                            hardwareBuffer, ts, getCurrentRotation()) != 0)) {
                         if (VERBOSE) {
                             Log.v(TAG,
                                     "Couldn't get buffer immediately, returning image images. "
@@ -185,6 +192,10 @@ public class CameraController {
                 }
             };
 
+    private volatile float mZoomRatio = 1.0f;
+    private RotationProvider mRotationProvider;
+    private CameraInfo mCameraInfo = null;
+
     public CameraController(Context context, WeakReference<DeviceAsWebcamFgService> serviceWeak) {
         mContext = context;
         mServiceWeak = serviceWeak;
@@ -194,6 +205,55 @@ public class CameraController {
         }
         startBackgroundThread();
         mCameraManager = mContext.getSystemService(CameraManager.class);
+        refreshLensFacingCameraIds();
+        mCameraId = mBackCameraId != null ? mBackCameraId : mFrontCameraId;
+        mCameraInfo = createCameraInfo(mCameraId);
+        mRotationProvider = new RotationProvider(context.getApplicationContext(),
+                mCameraInfo.getSensorOrientation());
+        // Adds an empty listener to enable the RotationProvider so that we can get the rotation
+        // degrees info to rotate the webcam stream images.
+        mRotationProvider.addListener(mCameraCallbacksExecutor, rotation -> {});
+    }
+
+    private void refreshLensFacingCameraIds() {
+        try {
+            String[] cameraIdList = mCameraManager.getCameraIdList();
+            if (cameraIdList == null) {
+                return;
+            }
+            for (String cameraId : cameraIdList) {
+                int lensFacing = getCameraCharacteristic(cameraId,
+                        CameraCharacteristics.LENS_FACING);
+                if (mBackCameraId == null && lensFacing == CameraMetadata.LENS_FACING_BACK) {
+                    mBackCameraId = cameraId;
+                } else if (mFrontCameraId == null
+                        && lensFacing == CameraMetadata.LENS_FACING_FRONT) {
+                    mFrontCameraId = cameraId;
+                }
+            }
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Failed to retrieve camera id list.", e);
+        }
+    }
+
+    private CameraInfo createCameraInfo(String cameraId) {
+        return cameraId == null ? null : new CameraInfo(
+                getCameraCharacteristic(cameraId, CameraCharacteristics.LENS_FACING),
+                getCameraCharacteristic(cameraId, CameraCharacteristics.SENSOR_ORIENTATION),
+                getCameraCharacteristic(cameraId, CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        );
+    }
+
+    private <T> T getCameraCharacteristic(String cameraId, CameraCharacteristics.Key<T> key) {
+        try {
+            CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(
+                    cameraId);
+            return characteristics.get(key);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Failed to get" + key.getName() + "characteristics for camera " + cameraId
+                    + ".");
+        }
+        return null;
     }
 
     public void setWebcamStreamConfig(boolean mjpeg, int width, int height, int fps) {
@@ -215,25 +275,37 @@ public class CameraController {
         }
     }
 
+    /**
+     * Must be called with mSerializationLock held.
+     */
     private void openCameraBlocking() {
         if (mCameraManager == null) {
             Log.e(TAG, "CameraManager is not initialized, aborting");
             return;
         }
+        if (mCameraId == null) {
+            Log.e(TAG, "No camera is found on the device, aborting");
+            return;
+        }
+        if (mCameraDevice != null) {
+            mCameraDevice.close();
+            mCameraDevice = null;
+        }
         try {
-            mCameraManager.openCamera(mCameraId, mThreadPoolExecutor, mCameraStateCallback);
+            mCameraManager.openCamera(mCameraId, mCameraCallbacksExecutor, mCameraStateCallback);
         } catch (CameraAccessException e) {
-            e.printStackTrace();
+            Log.e(TAG, "openCamera failed for cameraId : " + mCameraId, e);
         }
         mCameraOpened.block();
         mCameraOpened.close();
-        if (VERBOSE) {
-            Log.v(TAG, "Camera" + mCameraId + " opened ");
-        }
     }
 
     private void setupPreviewOnlyStreamLocked(SurfaceTexture previewSurfaceTexture) {
-        mPreviewSurface = new Surface(previewSurfaceTexture);
+        setupPreviewOnlyStreamLocked(new Surface(previewSurfaceTexture));
+    }
+
+    private void setupPreviewOnlyStreamLocked(Surface previewSurface) {
+        mPreviewSurface = previewSurface;
         try {
             openCameraBlocking();
             mPreviewRequestBuilder =
@@ -253,18 +325,23 @@ public class CameraController {
 
             mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration);
             createCaptureSessionBlocking();
+            mZoomRatio = 1.0f;
             mCurrentState = PREVIEW_STREAMING;
         } catch (CameraAccessException e) {
-            e.printStackTrace();
+            Log.e(TAG, "createCaptureRequest failed", e);
         }
     }
 
     private void setupPreviewStreamAlongsideWebcamStreamLocked(
             SurfaceTexture previewSurfaceTexture) {
+        setupPreviewStreamAlongsideWebcamStreamLocked(new Surface(previewSurfaceTexture));
+    }
+
+    private void setupPreviewStreamAlongsideWebcamStreamLocked(Surface previewSurface) {
         if (VERBOSE) {
             Log.v(TAG, "setupPreviewAlongsideWebcam");
         }
-        mPreviewSurface = new Surface(previewSurfaceTexture);
+        mPreviewSurface = previewSurface;
         mPreviewOutputConfiguration = new OutputConfiguration(mPreviewSurface);
         mPreviewRequestBuilder.addTarget(mPreviewSurface);
         mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration,
@@ -276,7 +353,7 @@ public class CameraController {
     public void startPreviewStreaming(SurfaceTexture surfaceTexture) {
         // Started on a background thread since we don't want to be blocking either the activity's
         // or the service's main thread (we call blocking camera open in these methods internally)
-        mThreadPoolExecutor.execute(new Runnable() {
+        mServiceEventsExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 synchronized (mSerializationLock) {
@@ -317,7 +394,7 @@ public class CameraController {
             createCaptureSessionBlocking();
             mCurrentState = WEBCAM_STREAMING;
         } catch (CameraAccessException e) {
-            e.printStackTrace();
+            Log.e(TAG, "createCaptureRequest failed", e);
         }
     }
 
@@ -338,7 +415,7 @@ public class CameraController {
     public void startWebcamStreaming() {
         // Started on a background thread since we don't want to be blocking the service's main
         // thread (we call blocking camera open in these methods internally)
-        mThreadPoolExecutor.execute(() -> {
+        mServiceEventsExecutor.execute(() -> {
             mStartCaptureWebcamStream.set(true);
             synchronized (mSerializationLock) {
                 if (mImgReader == null) {
@@ -377,7 +454,7 @@ public class CameraController {
     public void stopPreviewStreaming() {
         // Started on a background thread since we don't want to be blocking either the activity's
         // or the service's main thread (we call blocking camera open in these methods internally)
-        mThreadPoolExecutor.execute(new Runnable() {
+        mServiceEventsExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 synchronized (mSerializationLock) {
@@ -424,12 +501,13 @@ public class CameraController {
         mWebcamOutputConfiguration = null;
         mPreviewOutputConfiguration = null;
         mCurrentState = NO_STREAMING;
+        mZoomRatio = 1.0f;
     }
 
     public void stopWebcamStreaming() {
         // Started on a background thread since we don't want to be blocking the service's main
         // thread (we call blocking camera open in these methods internally)
-        mThreadPoolExecutor.execute(new Runnable() {
+        mServiceEventsExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 synchronized (mSerializationLock) {
@@ -454,18 +532,16 @@ public class CameraController {
     }
 
     private void startBackgroundThread() {
-        mImageReaderThread = new HandlerThread("SdkCameraFrameProviderThread");
-        mImageReaderThread.start();
-        mImageReaderHandler = new Handler(mImageReaderThread.getLooper());
-        // We need two handler threads since the surface texture add / remove calls from the fg
+        HandlerThread imageReaderThread = new HandlerThread("SdkCameraFrameProviderThread");
+        imageReaderThread.start();
+        mImageReaderHandler = new Handler(imageReaderThread.getLooper());
+        // We need two executor threads since the surface texture add / remove calls from the fg
         // service are going to be served on the main thread. To not wait on capture session
         // creation, onCaptureSequenceCompleted we need a new thread to cater to preview surface
         // addition / removal.
-
-        mThreadPoolExecutor =
-                new ThreadPoolExecutor(/*initial pool size*/ 2, /*Max pool size*/2,
-                        /*Alive time*/60, /*units*/TimeUnit.SECONDS, new LinkedBlockingQueue());
-        mThreadPoolExecutor.allowCoreThreadTimeOut(true);
+        // b/277099495 has additional context.
+        mCameraCallbacksExecutor = Executors.newSingleThreadExecutor();
+        mServiceEventsExecutor = Executors.newSingleThreadExecutor();
     }
 
     private void createCaptureSessionBlocking() {
@@ -473,11 +549,11 @@ public class CameraController {
             mCameraDevice.createCaptureSession(
                     new SessionConfiguration(
                             SessionConfiguration.SESSION_REGULAR, mOutputConfigurations,
-                            mThreadPoolExecutor, mCameraCaptureSessionCallback));
+                            mCameraCallbacksExecutor, mCameraCaptureSessionCallback));
             mCaptureSessionReady.block();
             mCaptureSessionReady.close();
         } catch (CameraAccessException e) {
-            e.printStackTrace();
+            Log.e(TAG, "createCaptureSession failed", e);
         }
     }
 
@@ -493,6 +569,88 @@ public class CameraController {
         if (VERBOSE) {
             Log.v(TAG, "Returned image " + timestamp);
         }
+    }
+
+    /**
+     * Returns the {@link CameraInfo} of the working camera.
+     */
+    public CameraInfo getCameraInfo() {
+        return mCameraInfo;
+    }
+
+    /**
+     * Sets the new zoom ratio setting to the working camera.
+     */
+    public void setZoomRatio(float zoomRatio) {
+        mZoomRatio = zoomRatio;
+        mServiceEventsExecutor.execute(() -> {
+            synchronized (mSerializationLock) {
+                if (mCameraDevice == null || mCaptureSession == null) {
+                    return;
+                }
+
+                try {
+                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio);
+                    mCaptureSession.setSingleRepeatingRequest(mPreviewRequestBuilder.build(),
+                            mCameraCallbacksExecutor, mCaptureCallback);
+                } catch (CameraAccessException e) {
+                    Log.e(TAG, "Failed to set zoom ratio to the working camera.", e);
+                }
+            }
+        });
+    }
+
+    /**
+     * Returns current zoom ratio setting.
+     */
+    public float getZoomRatio() {
+        return mZoomRatio;
+    }
+
+    /**
+     * Returns whether the device can support toggle camera function.
+     *
+     * @return {@code true} if the device has both back and front cameras. Otherwise, returns
+     * {@code false}.
+     */
+    public boolean canToggleCamera() {
+        return mBackCameraId != null && mFrontCameraId != null;
+    }
+
+    /**
+     * Toggles camera between the back and front cameras.
+     */
+    public void toggleCamera() {
+        mServiceEventsExecutor.execute(() -> {
+            synchronized (mSerializationLock) {
+                mCaptureSession.close();
+                if (mCameraId.equals(mBackCameraId)) {
+                    mCameraId = mFrontCameraId;
+                } else {
+                    mCameraId = mBackCameraId;
+                }
+                mCameraInfo = createCameraInfo(mCameraId);
+                switch (mCurrentState) {
+                    case WEBCAM_STREAMING:
+                        setupWebcamOnlyStreamAndOpenCameraLocked();
+                        break;
+                    case PREVIEW_STREAMING:
+                        setupPreviewOnlyStreamLocked(mPreviewSurface);
+                        break;
+                    case PREVIEW_AND_WEBCAM_STREAMING:
+                        setupWebcamOnlyStreamAndOpenCameraLocked();
+                        setupPreviewStreamAlongsideWebcamStreamLocked(mPreviewSurface);
+                        break;
+                }
+            }
+        });
+    }
+
+    /**
+     * Returns current rotation degrees value.
+     */
+    public int getCurrentRotation() {
+        return mRotationProvider.getRotation();
     }
 
     private static class ImageAndBuffer {
