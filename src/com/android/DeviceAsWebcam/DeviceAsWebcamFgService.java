@@ -27,6 +27,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
+import android.hardware.camera2.params.MeteringRectangle;
 import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
@@ -36,9 +37,11 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 
 import com.android.DeviceAsWebcam.annotations.UsedByNative;
+import com.android.DeviceAsWebcam.utils.IgnoredV4L2Nodes;
 
 import java.lang.ref.WeakReference;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 public class DeviceAsWebcamFgService extends Service {
     private static final String TAG = "DeviceAsWebcamFgService";
@@ -127,7 +130,8 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     private int setupServicesAndStartListening() {
-        return setupServicesAndStartListeningNative();
+        String[] ignoredNodes = IgnoredV4L2Nodes.getIgnoredNodes(getApplicationContext());
+        return setupServicesAndStartListeningNative(ignoredNodes);
     }
 
     @Override
@@ -149,15 +153,20 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     /**
-     * Returns a suitable preview size <= the maxPreviewSize so there is no FoV change between
-     * webcam and preview streams
+     * Returns the best suitable output size for preview.
      *
-     * @param maxPreviewSize The upper limit of preview size
+     * <p>If the webcam stream doesn't exist, find the largest 16:9 supported output size which is
+     * not larger than 1080p. If the webcam stream exists, find the largest supported output size
+     * which matches the aspect ratio of the webcam stream size and is not larger than the webcam
+     * stream size.
      */
-    public Size getSuitablePreviewSize(Size maxPreviewSize) {
+    public Size getSuitablePreviewSize() {
         synchronized (mServiceLock) {
-            // TODO(b/267794640): Make this dynamic
-            return new Size(1920, 1080);
+            if (!mServiceRunning) {
+                Log.e(TAG, "getSuitablePreviewSize called after Service was destroyed.");
+                return null;
+            }
+            return mCameraController.getSuitablePreviewSize();
         }
     }
 
@@ -166,14 +175,18 @@ public class DeviceAsWebcamFgService extends Service {
      * returned by {@link #getSuitablePreviewSize}.
      *
      * @param surfaceTexture surfaceTexture to stream preview frames to
+     * @param previewSize the preview size
+     * @param previewSizeChangeListener a listener to monitor the preview size change events.
      */
-    public void setPreviewSurfaceTexture(SurfaceTexture surfaceTexture) {
+    public void setPreviewSurfaceTexture(SurfaceTexture surfaceTexture, Size previewSize,
+            Consumer<Size> previewSizeChangeListener) {
         synchronized (mServiceLock) {
             if (!mServiceRunning) {
                 Log.e(TAG, "setPreviewSurfaceTexture called after Service was destroyed.");
                 return;
             }
-            mCameraController.startPreviewStreaming(surfaceTexture);
+            mCameraController.startPreviewStreaming(surfaceTexture, previewSize,
+                    previewSizeChangeListener);
         }
     }
 
@@ -386,18 +399,33 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     /**
+     * Trigger tap-to-focus operation for the specified metering rectangles.
+     */
+    public void tapToFocus(MeteringRectangle[] meteringRectangles) {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "tapToFocus was called after Service was destroyed");
+                return;
+            }
+            mCameraController.tapToFocus(meteringRectangles);
+        }
+    }
+
+    /**
      * Called by {@link DeviceAsWebcamReceiver} to check if the service should be started.
+     * @param ignoredNodes V4L2 nodes to ignore
      * @return {@code true} if the foreground service should be started,
      *         {@code false} if the service is already running or should not be started
      */
-    public static native boolean shouldStartServiceNative();
+    public static native boolean shouldStartServiceNative(String[] ignoredNodes);
 
     /**
      * Called during {@link #onStartCommand} to initialize the native side of the service.
+     * @param ignoredNodes V4L2 nodes to ignore
      * @return 0 if native side code was successfully initialized,
      *         non-0 otherwise
      */
-    private native int setupServicesAndStartListeningNative();
+    private native int setupServicesAndStartListeningNative(String[] ignoredNodes);
 
     /**
      * Called by {@link CameraController} to queue frames for encoding. The frames are encoded

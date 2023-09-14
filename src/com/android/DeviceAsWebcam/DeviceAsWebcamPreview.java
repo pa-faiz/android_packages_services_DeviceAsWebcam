@@ -23,16 +23,21 @@ import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.graphics.Insets;
+import android.graphics.Matrix;
+import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.params.MeteringRectangle;
 import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.IBinder;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
+import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
@@ -49,17 +54,16 @@ import com.android.DeviceAsWebcam.view.ZoomController;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public class DeviceAsWebcamPreview extends Activity {
     private static final String TAG = DeviceAsWebcamPreview.class.getSimpleName();
     private static final boolean VERBOSE = Log.isLoggable(TAG, Log.VERBOSE);
     private static final int ROTATION_ANIMATION_DURATION_MS = 300;
-
-    private static final int MAX_PREVIEW_WIDTH = 1920;
-    private static final int MAX_PREVIEW_HEIGHT = 1080;
+    private static final int FOCUS_INDICATOR_AUTO_HIDE_DURATION_MS = 1000;
+    private static final float METERING_RECTANGLE_SIZE = 0.15f;
 
     private final Executor mThreadExecutor = Executors.newFixedThreadPool(2);
-    private final Size mMaxPreviewSize = new Size(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGHT);
     private final ConditionVariable mServiceReady = new ConditionVariable();
 
     private boolean mTextureViewSetup = false;
@@ -69,8 +73,17 @@ public class DeviceAsWebcamPreview extends Activity {
     private FrameLayout mTextureViewContainer;
     private CardView mTextureViewCard;
     private TextureView mTextureView;
+    private View mFocusIndicator;
+    private Runnable mAutoHideFocusIndicator = () -> mFocusIndicator.setVisibility(View.GONE);
     private ZoomController mZoomController = null;
     private ImageButton mToggleCameraButton;
+    // A listener to monitor the preview size change events. This might be invoked when toggling
+    // camera or the webcam stream is started after the preview stream.
+    Consumer<Size> mPreviewSizeChangeListener = size -> runOnUiThread(() -> {
+                mPreviewSize = size;
+                setTextureViewScale();
+            }
+    );
 
     /**
      * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
@@ -92,17 +105,19 @@ public class DeviceAsWebcamPreview extends Activity {
                         }
                         if (mLocalFgService != null) {
                             mLocalFgService.setOnDestroyedCallback(() -> onServiceDestroyed());
-                            mLocalFgService.setPreviewSurfaceTexture(texture);
-                            if (mLocalFgService.canToggleCamera()) {
-                                mToggleCameraButton.setVisibility(View.VISIBLE);
-                                mToggleCameraButton.setOnClickListener(v -> toggleCamera());
-                            } else {
-                                mToggleCameraButton.setVisibility(View.GONE);
+                            if (mPreviewSize != null) {
+                                mLocalFgService.setPreviewSurfaceTexture(texture, mPreviewSize,
+                                        mPreviewSizeChangeListener);
+                                if (mLocalFgService.canToggleCamera()) {
+                                    mToggleCameraButton.setVisibility(View.VISIBLE);
+                                    mToggleCameraButton.setOnClickListener(v -> toggleCamera());
+                                } else {
+                                    mToggleCameraButton.setVisibility(View.GONE);
+                                }
+                                rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
+                                mLocalFgService.setRotationUpdateListener(
+                                        rotation -> rotateUiByRotationDegrees(rotation));
                             }
-                            rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
-                            mLocalFgService.setRotationUpdateListener(
-                                    rotation -> runOnUiThread(
-                                            () -> rotateUiByRotationDegrees(rotation)));
                         }
                     });
                 }
@@ -166,7 +181,19 @@ public class DeviceAsWebcamPreview extends Activity {
                 }
             };
 
+    private GestureDetector.SimpleOnGestureListener mTapToFocusListener =
+            new GestureDetector.SimpleOnGestureListener() {
+                @Override
+                public boolean onSingleTapUp(MotionEvent motionEvent) {
+                    return tapToFocus(motionEvent);
+                }
+            };
+
     private void setTextureViewScale() {
+        FrameLayout.LayoutParams frameLayout = new FrameLayout.LayoutParams(mPreviewSize.getWidth(),
+                mPreviewSize.getHeight(), Gravity.CENTER);
+        mTextureView.setLayoutParams(frameLayout);
+
         int pWidth = mTextureViewContainer.getWidth();
         int pHeight = mTextureViewContainer.getHeight();
         float scaleYToUnstretched = (float) mPreviewSize.getWidth() / mPreviewSize.getHeight();
@@ -212,9 +239,13 @@ public class DeviceAsWebcamPreview extends Activity {
                 getApplicationContext(), zoomRatioRange, currentZoomRatio,
                 mZoomRatioListener);
 
+        GestureDetector tapToFocusGestureDetector = new GestureDetector(getApplicationContext(),
+                mTapToFocusListener);
+
         mTextureView.setOnTouchListener(
                 (view, event) -> {
                     mMotionEventToZoomRatioConverter.onTouchEvent(event);
+                    tapToFocusGestureDetector.onTouchEvent(event);
                     return true;
                 });
 
@@ -274,12 +305,11 @@ public class DeviceAsWebcamPreview extends Activity {
     }
 
     private void setupTextureViewLayout() {
-        mPreviewSize = mLocalFgService.getSuitablePreviewSize(mMaxPreviewSize);
-        FrameLayout.LayoutParams frameLayout = new FrameLayout.LayoutParams(mPreviewSize.getWidth(),
-                mPreviewSize.getHeight(), Gravity.CENTER);
-        mTextureView.setLayoutParams(frameLayout);
-        setTextureViewScale();
-        setupZoomUiControl();
+        mPreviewSize = mLocalFgService.getSuitablePreviewSize();
+        if (mPreviewSize != null) {
+            setTextureViewScale();
+            setupZoomUiControl();
+        }
     }
 
     private void onServiceDestroyed() {
@@ -303,6 +333,7 @@ public class DeviceAsWebcamPreview extends Activity {
         mTextureViewContainer = findViewById(R.id.texture_view_container);
         mTextureViewCard = findViewById(R.id.texture_view_card);
         mTextureView = findViewById(R.id.texture_view);
+        mFocusIndicator = findViewById(R.id.focus_indicator);
         mToggleCameraButton = findViewById(R.id.toggle_camera_button);
         mZoomController = findViewById(R.id.zoom_ui_controller);
 
@@ -353,8 +384,9 @@ public class DeviceAsWebcamPreview extends Activity {
                 setupTextureViewLayout();
                 mTextureViewSetup = true;
             }
-            if (mLocalFgService != null) {
-                mLocalFgService.setPreviewSurfaceTexture(mTextureView.getSurfaceTexture());
+            if (mLocalFgService != null && mPreviewSize != null) {
+                mLocalFgService.setPreviewSurfaceTexture(mTextureView.getSurfaceTexture(),
+                        mPreviewSize, mPreviewSizeChangeListener);
                 rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
                 mLocalFgService.setRotationUpdateListener(rotation ->
                         runOnUiThread(() -> rotateUiByRotationDegrees(rotation)));
@@ -395,5 +427,84 @@ public class DeviceAsWebcamPreview extends Activity {
         setupZoomRatioSeekBar();
         mZoomController.setZoomRatio(mLocalFgService.getZoomRatio(),
                 ZoomController.ZOOM_UI_TOGGLE_MODE);
+    }
+
+    private boolean tapToFocus(MotionEvent motionEvent) {
+        if (mLocalFgService == null || mLocalFgService.getCameraInfo() == null) {
+            return false;
+        }
+
+        float[] normalizedPoint = calculateNormalizedPoint(motionEvent);
+        showFocusIndicatorWithAutoHide(normalizedPoint);
+        MeteringRectangle meteringRectangle = calculateMeteringRectangle(normalizedPoint);
+
+        if (meteringRectangle == null) {
+            return false;
+        }
+
+        mLocalFgService.tapToFocus(new MeteringRectangle[]{meteringRectangle});
+
+        return true;
+    }
+
+    /**
+     * Calculates the normalized point which will be the point between [0, 0] to [1, 1] mapping to
+     * the preview size.
+     */
+    private float[] calculateNormalizedPoint(MotionEvent motionEvent) {
+        return new float[]{motionEvent.getX() / mPreviewSize.getWidth(),
+                motionEvent.getY() / mPreviewSize.getHeight()};
+    }
+
+    /**
+     * Calculates the metering rectangle according to the normalized point.
+     */
+    private MeteringRectangle calculateMeteringRectangle(float[] normalizedPoint) {
+        CameraInfo cameraInfo = mLocalFgService.getCameraInfo();
+        Rect activeArraySize = cameraInfo.getActiveArraySize();
+        float halfMeteringRectWidth = (METERING_RECTANGLE_SIZE * activeArraySize.width()) / 2;
+        float halfMeteringRectHeight = (METERING_RECTANGLE_SIZE * activeArraySize.height()) / 2;
+
+        Matrix matrix = new Matrix();
+        matrix.postRotate(-cameraInfo.getSensorOrientation(), 0.5f, 0.5f);
+        // Flips if current working camera is front camera
+        if (cameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
+            matrix.postScale(1, -1, 0.5f, 0.5f);
+        }
+        matrix.postScale(activeArraySize.width(), activeArraySize.height());
+        matrix.mapPoints(normalizedPoint);
+
+        Rect meteringRegion = new Rect(
+                clamp((int) (normalizedPoint[0] - halfMeteringRectWidth), 0,
+                        activeArraySize.width()),
+                clamp((int) (normalizedPoint[1] - halfMeteringRectHeight), 0,
+                        activeArraySize.height()),
+                clamp((int) (normalizedPoint[0] + halfMeteringRectWidth), 0,
+                        activeArraySize.width()),
+                clamp((int) (normalizedPoint[1] + halfMeteringRectHeight), 0,
+                        activeArraySize.height())
+        );
+
+        return new MeteringRectangle(meteringRegion, MeteringRectangle.METERING_WEIGHT_MAX);
+    }
+
+    /**
+     * Show the focus indicator and hide it automatically after a proper duration.
+     */
+    private void showFocusIndicatorWithAutoHide(float[] normalizedPoint) {
+        mFocusIndicator.setVisibility(View.VISIBLE);
+        float translationX =
+                normalizedPoint[0] * mTextureViewCard.getWidth() - mFocusIndicator.getWidth() / 2f;
+        float translationY = normalizedPoint[1] * mTextureViewCard.getHeight()
+                - mFocusIndicator.getHeight() / 2f;
+        mFocusIndicator.setTranslationX(translationX);
+        mFocusIndicator.setTranslationY(translationY);
+        getMainThreadHandler().removeCallbacks(mAutoHideFocusIndicator);
+        getMainThreadHandler().postDelayed(mAutoHideFocusIndicator,
+                FOCUS_INDICATOR_AUTO_HIDE_DURATION_MS);
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.min(Math.max(value, min), max);
     }
 }

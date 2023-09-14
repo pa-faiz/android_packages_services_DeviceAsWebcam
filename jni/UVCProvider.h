@@ -27,6 +27,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <unordered_set>
 
 namespace android {
 namespace webcam {
@@ -95,14 +96,14 @@ struct FormatTriplet {
 // This class manages all things related to UVC event handling.
 class UVCProvider : public std::enable_shared_from_this<UVCProvider> {
   public:
-    static std::string getVideoNode();
+    static std::string getVideoNode(const std::unordered_set<std::string>& ignoredNodes);
 
     UVCProvider() = default;
     ~UVCProvider();
 
     Status init();
     // Start listening for UVC events
-    Status startService();
+    Status startService(const std::unordered_set<std::string>& ignoredNodes);
 
     void stopService();
 
@@ -116,11 +117,14 @@ class UVCProvider : public std::enable_shared_from_this<UVCProvider> {
     // for probing and committing controls.
     class UVCDevice : public BufferCreatorAndDestroyer {
       public:
-        explicit UVCDevice(std::weak_ptr<UVCProvider> parent);
+        explicit UVCDevice(std::weak_ptr<UVCProvider> parent,
+                           const std::unordered_set<std::string>& ignoredNodes);
         ~UVCDevice() override = default;
         void closeUVCFd();
         [[nodiscard]] bool isInited() const;
         int getUVCFd() { return mUVCFd.get(); }
+        int getINotifyFd() { return mINotifyFd.get(); }
+        const char* getCurrentVideoNode() { return mVideoNode.c_str(); }
         void processSetupEvent(const struct usb_ctrlrequest* request,
                                struct uvc_request_data* response);
         void processSetupControlEvent(const struct usb_ctrlrequest* request,
@@ -167,7 +171,10 @@ class UVCProvider : public std::enable_shared_from_this<UVCProvider> {
         std::shared_ptr<UVCProperties> mUVCProperties;
         std::shared_ptr<BufferManager> mBufferManager;
         std::shared_ptr<FrameProvider> mFrameProvider;
+
         unique_fd mUVCFd;
+        unique_fd mINotifyFd;
+
         // Path to /dev/video*, this is the node we open up and poll the fd for uvc / v4l2 events.
         std::string mVideoNode;
         struct v4l2_format mV4l2Format {};
@@ -180,6 +187,8 @@ class UVCProvider : public std::enable_shared_from_this<UVCProvider> {
     void ListenToUVCFds();
 
     void processUVCEvent();
+    // returns true if service is stopped. false otherwise.
+    bool processINotifyEvent();
 
     std::shared_ptr<UVCDevice> mUVCDevice;
     std::thread mUVCListenerThread;
