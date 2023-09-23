@@ -52,11 +52,13 @@ import android.view.Display;
 import android.view.Surface;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.android.DeviceAsWebcam.utils.UserPrefs;
 
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
@@ -108,8 +110,10 @@ public class CameraController {
     // size.
     private static final float METERING_RECTANGLE_SIZE_RATIO = 0.15f;
 
-    private String mBackCameraId = null;
-    private String mFrontCameraId = null;
+    @Nullable
+    private CameraId mBackCameraId = null;
+    @Nullable
+    private CameraId mFrontCameraId = null;
 
     private ImageReader mImgReader;
     private ImageWriter mImageWriter;
@@ -157,9 +161,11 @@ public class CameraController {
     private final Object mSerializationLock = new Object();
     // timestamp -> Image
     private ConcurrentHashMap<Long, ImageAndBuffer> mImageMap = new ConcurrentHashMap<>();
-    // TODO(b/267794640): UI to select camera id
-    private String mCameraId = null;
-    private ArrayMap<String, CameraInfo> mCameraInfoMap = new ArrayMap<>();
+    private List<CameraId> mAvailableCameraIds = new ArrayList<>();
+    @Nullable
+    private CameraId mCameraId = null;
+    private ArrayMap<CameraId, CameraInfo> mCameraInfoMap = new ArrayMap<>();
+    @Nullable
     private float[] mTapToFocusPoints = null;
     private static class StreamConfigs {
         StreamConfigs(boolean mjpegP, int widthP, int heightP, int fpsP) {
@@ -270,7 +276,8 @@ public class CameraController {
                             cameraId, CameraAvailabilityState.WAITING_FOR_UNAVAILABLE);
                     break;
                 case WAITING_FOR_AVAILABLE:
-                    if (mStartCaptureWebcamStream.get() && cameraId.equals(mCameraId)) {
+                    if (mStartCaptureWebcamStream.get() && cameraId.equals(
+                            mCameraId.mainCameraId)) {
                         if (VERBOSE) {
                             Log.v(TAG, "Camera is available : starting webcam stream for camera id "
                                     + cameraId);
@@ -356,6 +363,7 @@ public class CameraController {
     private RotationUpdateListener mRotationUpdateListener = null;
     private CameraInfo mCameraInfo = null;
     private UserPrefs mUserPrefs;
+    VendorCameraPrefs mRroCameraInfo;
 
     public CameraController(Context context, WeakReference<DeviceAsWebcamFgService> serviceWeak) {
         mContext = context;
@@ -369,13 +377,16 @@ public class CameraController {
         mDisplaySize = getDisplayPreviewSize();
         mCameraManager.registerAvailabilityCallback(
                 mCameraCallbacksExecutor, mCameraAvailabilityCallbacks);
+        mRroCameraInfo = VendorCameraPrefs.getVendorCameraPrefsFromJson(mContext);
+        mUserPrefs = new UserPrefs(mContext);
+
+        refreshAvailableCameraIdList();
         refreshLensFacingCameraIds();
 
-        mUserPrefs = new UserPrefs(mContext);
-        mCameraId = mUserPrefs.fetchCameraId(/*defaultCameraId*/ mBackCameraId);
-        mZoomRatio = mUserPrefs.fetchZoomRatio(mCameraId, /*defaultZoom*/ 1.0f);
+        mCameraId = fetchCameraIdFromUserPrefs(/*defaultCameraId*/ mBackCameraId);
+        mCameraInfo = getOrCreateCameraInfo(mCameraId);
+        mZoomRatio = mUserPrefs.fetchZoomRatio(mCameraId.toString(), /*defaultZoom*/ 1.0f);
 
-        mCameraInfo = mCameraInfoMap.get(mCameraId);
         mRotationProvider = new RotationProvider(context.getApplicationContext(),
                 mCameraInfo.getSensorOrientation(), mCameraInfo.getLensFacing());
         // Adds a listener to enable the RotationProvider so that we can get the rotation
@@ -385,6 +396,40 @@ public class CameraController {
                 mRotationUpdateListener.onRotationUpdated(rotation);
             }
         });
+    }
+
+    @Nullable
+    private CameraId fetchCameraIdFromUserPrefs(@Nullable CameraId defaultCameraId) {
+        String cameraIdString = mUserPrefs.fetchCameraId(null);
+        CameraId cameraId = convertAndValidateCameraIdString(cameraIdString);
+        return cameraId != null ? cameraId : defaultCameraId;
+    }
+
+    @Nullable
+    private CameraId fetchBackCameraIdFromUserPrefs(@Nullable CameraId defaultCameraId) {
+        String cameraIdString = mUserPrefs.fetchBackCameraId(null);
+        CameraId cameraId = convertAndValidateCameraIdString(cameraIdString);
+        return cameraId != null ? cameraId : defaultCameraId;
+    }
+
+    @Nullable
+    private CameraId fetchFrontCameraIdFromUserPrefs(@Nullable CameraId defaultCameraId) {
+        String cameraIdString = mUserPrefs.fetchFrontCameraId(null);
+        CameraId cameraId = convertAndValidateCameraIdString(cameraIdString);
+        return cameraId != null ? cameraId : defaultCameraId;
+    }
+
+    /**
+     * Converts the camera id string to {@link CameraId} and returns it only when it is includes in
+     * the available camera id list.
+     */
+    @Nullable
+    private CameraId convertAndValidateCameraIdString(@Nullable String cameraIdString) {
+        CameraId cameraId = CameraId.fromCameraIdString(cameraIdString);
+        if (cameraId != null && !mAvailableCameraIds.contains(cameraId)) {
+            cameraId = null;
+        }
+        return cameraId;
     }
 
     private void convertARGBToRGBA(ByteBuffer argb) {
@@ -439,59 +484,186 @@ public class CameraController {
         convertARGBToRGBA(byteBuffer);
         mCombinedBitmapBytes = byteBuffer.array();
     }
-    private void refreshLensFacingCameraIds() {
-        VendorCameraPrefs rroCameraInfo =
-                VendorCameraPrefs.getVendorCameraPrefsFromJson(mContext);
+
+    private void refreshAvailableCameraIdList() {
+        String[] cameraIdList;
         try {
-            String[] cameraIdList = mCameraManager.getCameraIdList();
-            if (cameraIdList == null) {
-                return;
-            }
-            for (String cameraId : cameraIdList) {
-                int lensFacing = getCameraCharacteristic(cameraId,
-                        CameraCharacteristics.LENS_FACING);
-                if (mBackCameraId == null && lensFacing == CameraMetadata.LENS_FACING_BACK) {
-                    mBackCameraId = cameraId;
-                } else if (mFrontCameraId == null
-                        && lensFacing == CameraMetadata.LENS_FACING_FRONT) {
-                    mFrontCameraId = cameraId;
-                }
-                mCameraInfoMap.put(cameraId,
-                        createCameraInfo(cameraId, rroCameraInfo.getPhysicalCameraInfos(cameraId)));
-            }
+            cameraIdList = mCameraManager.getCameraIdList();
         } catch (CameraAccessException e) {
-            Log.e(TAG, "Failed to retrieve camera id list.", e);
+            Log.e(TAG, "Failed to retrieve the camera id list from CameraManager!", e);
+            return;
+        }
+
+        List<String> ignoredCameraList = mRroCameraInfo.getIgnoredCameraList();
+
+        for (String cameraId : cameraIdList) {
+            // Skips the ignored cameras
+            if (ignoredCameraList.contains(cameraId)) {
+                continue;
+            }
+
+            CameraCharacteristics characteristics = getCameraCharacteristicsOrNull(cameraId);
+
+            if (characteristics == null) {
+                continue;
+            }
+
+            // Only lists backward compatible cameras
+            if (!isBackwardCompatible(characteristics)) {
+                continue;
+            }
+
+            List<VendorCameraPrefs.PhysicalCameraInfo> physicalCameraInfos =
+                    mRroCameraInfo.getPhysicalCameraInfos(cameraId);
+
+            if (physicalCameraInfos == null || physicalCameraInfos.isEmpty()) {
+                mAvailableCameraIds.add(new CameraId(cameraId, null));
+                continue;
+            }
+
+            for (VendorCameraPrefs.PhysicalCameraInfo physicalCameraInfo :
+                    physicalCameraInfos) {
+                // Only lists backward compatible cameras
+                CameraCharacteristics physChars = getCameraCharacteristicsOrNull(
+                        physicalCameraInfo.physicalCameraId);
+                if (isBackwardCompatible(physChars)) {
+                    mAvailableCameraIds.add(
+                            new CameraId(cameraId, physicalCameraInfo.physicalCameraId));
+                }
+            }
         }
     }
 
-    private CameraInfo createCameraInfo(String cameraId,
-            List<VendorCameraPrefs.PhysicalCameraInfo> physicalInfos) {
-        String workingCameraId =
-                (physicalInfos != null && !physicalInfos.isEmpty()) ? physicalInfos.get(
-                        0).physicalCameraId : cameraId;
-        CameraCharacteristics chars = getCameraCharacteristicsOrNull(cameraId);
-        CameraCharacteristics physicalChars = getCameraCharacteristicsOrNull(workingCameraId);
+    private void refreshLensFacingCameraIds() {
+        // Loads the default back and front camera from the user prefs.
+        mBackCameraId = fetchBackCameraIdFromUserPrefs(null);
+        mFrontCameraId = fetchFrontCameraIdFromUserPrefs(null);
+
+        if (mBackCameraId != null && mFrontCameraId != null) {
+            return;
+        }
+
+        for (CameraId cameraId : mAvailableCameraIds) {
+            CameraCharacteristics characteristics = getCameraCharacteristicsOrNull(
+                    cameraId.mainCameraId);
+            if (characteristics == null) {
+                continue;
+            }
+
+            Integer lensFacing = getCameraCharacteristic(characteristics,
+                    CameraCharacteristics.LENS_FACING);
+            if (lensFacing == null) {
+                continue;
+            }
+            if (mBackCameraId == null && lensFacing == CameraMetadata.LENS_FACING_BACK) {
+                mBackCameraId = cameraId;
+            } else if (mFrontCameraId == null
+                    && lensFacing == CameraMetadata.LENS_FACING_FRONT) {
+                mFrontCameraId = cameraId;
+            }
+        }
+    }
+
+    /**
+     * Returns the available {@link CameraId} list.
+     */
+    public List<CameraId> getAvailableCameraIds() {
+        return mAvailableCameraIds;
+    }
+
+    public CameraInfo getOrCreateCameraInfo(CameraId cameraId) {
+        CameraInfo cameraInfo = mCameraInfoMap.get(cameraId);
+        if (cameraInfo != null) {
+            return cameraInfo;
+        }
+
+        cameraInfo = createCameraInfo(cameraId);
+        mCameraInfoMap.put(cameraId, cameraInfo);
+        return cameraInfo;
+    }
+
+    private CameraInfo createCameraInfo(CameraId cameraId) {
+        CameraCharacteristics chars = getCameraCharacteristicsOrNull(cameraId.mainCameraId);
+        CameraCharacteristics physicalChars = getCameraCharacteristicsOrNull(
+                cameraId.physicalCameraId != null ? cameraId.physicalCameraId
+                        : cameraId.mainCameraId);
+        // Retrieves the physical camera zoom ratio range from the vendor camera prefs.
+        Range<Float> zoomRatioRange = mRroCameraInfo.getPhysicalCameraZoomRatioRange(cameraId);
+        // Retrieves the physical camera zoom ratio range if no custom data is found.
+        if (zoomRatioRange == null) {
+            zoomRatioRange = getCameraCharacteristic(physicalChars,
+                    CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+        }
+
+        // Logical cameras will be STANDARD category by default. For physical cameras, their
+        // categories should be specified by the vendor. If the category is not provided, use
+        // focal lengths to determine the physical camera's category.
+        CameraCategory cameraCategory = CameraCategory.STANDARD;
+        if (cameraId.physicalCameraId != null) {
+            cameraCategory = mRroCameraInfo.getCameraCategory(cameraId);
+            if (cameraCategory == CameraCategory.UNKNOWN) {
+                if (physicalChars != null) {
+                    cameraCategory = calculateCameraCategoryByFocalLengths(physicalChars);
+                }
+            }
+        }
         // We should consider using a builder pattern here if the parameters grow a lot.
         return new CameraInfo(
+                new CameraId(cameraId.mainCameraId, cameraId.physicalCameraId),
                 getCameraCharacteristic(chars, CameraCharacteristics.LENS_FACING),
                 getCameraCharacteristic(chars, CameraCharacteristics.SENSOR_ORIENTATION),
-                // TODO: b/269644311 Need to find a way to correct the available zoom ratio range
-                //  when a specific physical camera is used.
-                getCameraCharacteristic(physicalChars,
-                        CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE),
-                physicalInfos,
+                zoomRatioRange,
                 getCameraCharacteristic(chars,
                         CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
                 isFacePrioritySupported(chars),
-                isStreamUseCaseSupported(chars)
+                isStreamUseCaseSupported(chars),
+                cameraCategory
         );
     }
 
+    private CameraCategory calculateCameraCategoryByFocalLengths(
+            CameraCharacteristics characteristics) {
+        float[] focalLengths = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+
+        if (focalLengths == null) {
+            return CameraCategory.UNKNOWN;
+        }
+
+        final int standardCamera = 0x1;
+        final int telephotoCamera = 0x2;
+        final int wideAngleCamera = 0x4;
+        final int ultraWideCamera = 0x8;
+
+        int cameraCategory = 0;
+
+        for (float focalLength : focalLengths) {
+            if (focalLength >= 50) {
+                cameraCategory |= telephotoCamera;
+            } else if (focalLength >= 30) {
+                cameraCategory |= standardCamera;
+            } else if (focalLength >= 20) {
+                cameraCategory |= wideAngleCamera;
+            } else {
+                cameraCategory |= ultraWideCamera;
+            }
+        }
+
+        return switch (cameraCategory) {
+            case telephotoCamera -> CameraCategory.TELEPHOTO;
+            case wideAngleCamera -> CameraCategory.WIDE_ANGLE;
+            case ultraWideCamera -> CameraCategory.ULTRA_WIDE;
+            default -> CameraCategory.STANDARD;
+        };
+    }
+
+    @Nullable
     private static <T> T getCameraCharacteristic(CameraCharacteristics chars,
             CameraCharacteristics.Key<T> key) {
         return chars.get(key);
     }
 
+    @Nullable
     private CameraCharacteristics getCameraCharacteristicsOrNull(String cameraId) {
         try {
             CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(
@@ -504,6 +676,7 @@ public class CameraController {
       return null;
     }
 
+    @Nullable
     private <T> T getCameraCharacteristic(String cameraId, CameraCharacteristics.Key<T> key) {
         CameraCharacteristics chars = getCameraCharacteristicsOrNull(cameraId);
         if (chars != null) {
@@ -600,7 +773,8 @@ public class CameraController {
             mCameraDevice = null;
         }
         try {
-            mCameraManager.openCamera(mCameraId, mCameraCallbacksExecutor, mCameraStateCallback);
+            mCameraManager.openCamera(mCameraId.mainCameraId, mCameraCallbacksExecutor,
+                    mCameraStateCallback);
         } catch (CameraAccessException e) {
             Log.e(TAG, "openCamera failed for cameraId : " + mCameraId, e);
             startShowingCameraUnavailableLogo();
@@ -667,7 +841,7 @@ public class CameraController {
         return captureRequestBuilder;
     }
 
-    private static boolean checkArrayContains(int[] array, int value) {
+    private static boolean checkArrayContains(@Nullable int[] array, int value) {
         if (array == null) {
             return false;
         }
@@ -678,6 +852,13 @@ public class CameraController {
         }
 
         return false;
+    }
+
+    private static boolean isBackwardCompatible(CameraCharacteristics chars) {
+        int[] availableCapabilities = getCameraCharacteristic(chars,
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        return checkArrayContains(availableCapabilities,
+                CaptureRequest.REQUEST_AVAILABLE_CAPABILITIES_BACKWARD_COMPATIBLE);
     }
 
     private static boolean isFacePrioritySupported(CameraCharacteristics chars) {
@@ -1009,16 +1190,9 @@ public class CameraController {
     }
 
     private void createCaptureSessionBlocking() {
-        CameraInfo cameraInfo = mCameraInfoMap.get(mCameraId);
-        List<VendorCameraPrefs.PhysicalCameraInfo> physicalInfos =
-                cameraInfo.getPhysicalCameraInfos();
-        if (physicalInfos != null && physicalInfos.size() != 0) {
-            // For now we just consider the first physical camera id.
-            String physicalCameraId = physicalInfos.get(0).physicalCameraId;
-            // TODO: b/269644311 charcoalchen@google.com : Allow UX to display labels
-            // and choose amongst physical camera ids if offered by vendor.
+        if (mCameraId.physicalCameraId != null) {
             for (OutputConfiguration config : mOutputConfigurations) {
-                config.setPhysicalCameraId(physicalCameraId);
+                config.setPhysicalCameraId(mCameraId.physicalCameraId);
             }
         }
 
@@ -1070,7 +1244,7 @@ public class CameraController {
                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio);
                     mCaptureSession.setSingleRepeatingRequest(mPreviewRequestBuilder.build(),
                             mCameraCallbacksExecutor, mCaptureCallback);
-                    mUserPrefs.storeZoomRatio(mCameraId, mZoomRatio);
+                    mUserPrefs.storeZoomRatio(mCameraId.toString(), mZoomRatio);
                 } catch (CameraAccessException e) {
                     Log.e(TAG, "Failed to set zoom ratio to the working camera.", e);
                 }
@@ -1086,16 +1260,6 @@ public class CameraController {
     }
 
     /**
-     * Returns whether the device can support toggle camera function.
-     *
-     * @return {@code true} if the device has both back and front cameras. Otherwise, returns
-     * {@code false}.
-     */
-    public boolean canToggleCamera() {
-        return mBackCameraId != null && mFrontCameraId != null;
-    }
-
-    /**
      * Toggles camera between the back and front cameras.
      *
      * The new camera is set up and configured asynchronously, but the camera state (as queried by
@@ -1105,15 +1269,37 @@ public class CameraController {
      */
     public void toggleCamera() {
         synchronized (mSerializationLock) {
-            if (mCameraId.equals(mBackCameraId)) {
-                mCameraId = mFrontCameraId;
+            CameraId newCameraId;
+
+            if (Objects.equals(mCameraId, mBackCameraId)) {
+                newCameraId = mFrontCameraId;
             } else {
-                mCameraId = mBackCameraId;
+                newCameraId = mBackCameraId;
             }
-            mCameraInfo = mCameraInfoMap.get(mCameraId);
-            mUserPrefs.storeCameraId(mCameraId);
-            mZoomRatio = mUserPrefs.fetchZoomRatio(mCameraId, /*defaultZoom*/ 1.0f);
+
+            switchCamera(newCameraId);
+        }
+    }
+
+    /**
+     * Switches current working camera to specific one.
+     */
+    public void switchCamera(CameraId cameraId) {
+        synchronized (mSerializationLock) {
+            mCameraId = cameraId;
+            mUserPrefs.storeCameraId(cameraId.toString());
+            mCameraInfo = getOrCreateCameraInfo(mCameraId);
+            mZoomRatio = mUserPrefs.fetchZoomRatio(mCameraId.toString(), /*defaultZoom*/ 1.0f);
             mTapToFocusPoints = null;
+
+            // Stores the preferred back or front camera options
+            if (mCameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_BACK) {
+                mBackCameraId = mCameraId;
+                mUserPrefs.storeBackCameraId(mBackCameraId.toString());
+            } else if (mCameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
+                mFrontCameraId = mCameraId;
+                mUserPrefs.storeFrontCameraId(mFrontCameraId.toString());
+            }
         }
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
@@ -1183,7 +1369,7 @@ public class CameraController {
         final Rational targetAspectRatio = new Rational(maxPreviewSize.getWidth(),
                 maxPreviewSize.getHeight());
 
-        StreamConfigurationMap map = getCameraCharacteristic(mCameraId,
+        StreamConfigurationMap map = getCameraCharacteristic(mCameraId.mainCameraId,
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
 
         if (map == null) {
