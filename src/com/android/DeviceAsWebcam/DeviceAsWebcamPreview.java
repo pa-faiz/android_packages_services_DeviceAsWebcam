@@ -35,6 +35,7 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.ShapeDrawable;
 import android.graphics.drawable.shapes.OvalShape;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraMetadata;
 import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.IBinder;
@@ -108,6 +109,30 @@ public class DeviceAsWebcamPreview extends Activity {
                         mZoomController.onAccessibilityServicesEnabled(areServicesEnabled));
             };
 
+
+    /**
+     * {@link View.OnLayoutChangeListener} to add to
+     * {@link DeviceAsWebcamPreview#mTextureViewContainer} for when we need to know
+     * when changes to the view are committed.
+     * <p>
+     * NOTE: This removes itself as a listener after one call to prevent spurious callbacks
+     *       once the texture view has been resized.
+     */
+    View.OnLayoutChangeListener mTextureViewContainerLayoutListener =
+            new View.OnLayoutChangeListener() {
+                @Override
+                public void onLayoutChange(View view, int left, int top, int right, int bottom,
+                                           int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                    // Remove self to prevent further calls to onLayoutChange.
+                    view.removeOnLayoutChangeListener(this);
+                    // Update the texture view to fit the new bounds.
+                    runOnUiThread(() -> {
+                        if (mPreviewSize != null) {
+                            setTextureViewScale();
+                        }
+                    });
+                }
+            };
 
     /**
      * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
@@ -323,7 +348,7 @@ public class DeviceAsWebcamPreview extends Activity {
         if (mLocalFgService == null || mLocalFgService.getCameraInfo() == null) {
             return;
         }
-
+        setToggleCameraContentDescription();
         mSelectorListItemDataList = createSelectorItemDataList();
 
         mSwitchCameraSelectorView.init(getLayoutInflater(), mSelectorListItemDataList);
@@ -420,14 +445,24 @@ public class DeviceAsWebcamPreview extends Activity {
         // Update view to allow for status bar. This let's us keep a consistent background color
         // behind the statusbar.
         mTextureViewContainer.setOnApplyWindowInsetsListener((view, inset) -> {
-            Insets statusBarInset = inset.getInsets(WindowInsets.Type.statusBars());
+            Insets cutoutInset = inset.getInsets(WindowInsets.Type.displayCutout());
+            int minMargin = (int) getResources().getDimension(R.dimen.preview_margin_top_min);
+
             ViewGroup.MarginLayoutParams layoutParams =
                     (ViewGroup.MarginLayoutParams) mTextureViewContainer.getLayoutParams();
-            // This callback will be called every time the window insets change,
-            // including when the status bar is hidden. So apply the max statusbar height
-            // we have seen
-            layoutParams.topMargin = Math.max(layoutParams.topMargin, statusBarInset.top);
-            mTextureViewContainer.setLayoutParams(layoutParams);
+            // Set the top margin to accommodate the cutout. However, if the cutout is
+            // very small, add a small margin to prevent the preview from going too close to
+            // the edge of the device.
+            int newMargin = Math.max(minMargin, cutoutInset.top);
+            if (newMargin != layoutParams.topMargin) {
+                layoutParams.topMargin = Math.max(minMargin, cutoutInset.top);
+                mTextureViewContainer.setLayoutParams(layoutParams);
+                // subscribe to layout changes of the texture view container so we can
+                // resize the texture view once the container has been drawn with the new
+                // margins
+                mTextureViewContainer
+                        .addOnLayoutChangeListener(mTextureViewContainerLayoutListener);
+            }
             return WindowInsets.CONSUMED;
         });
 
@@ -572,12 +607,25 @@ public class DeviceAsWebcamPreview extends Activity {
         return hasBackCamera && hasFrontCamera;
     }
 
+    private void setToggleCameraContentDescription() {
+        if (mLocalFgService == null) {
+            return;
+        }
+        int lensFacing = mLocalFgService.getCameraInfo().getLensFacing();
+        CharSequence descr = getText(R.string.toggle_camera_button_description_front);
+        if (lensFacing == CameraMetadata.LENS_FACING_FRONT) {
+            descr = getText(R.string.toggle_camera_button_description_back);
+        }
+        mToggleCameraButton.setContentDescription(descr);
+    }
+
     private void toggleCamera() {
         if (mLocalFgService == null) {
             return;
         }
 
         mLocalFgService.toggleCamera();
+        setToggleCameraContentDescription();
         mFocusIndicator.setVisibility(View.GONE);
         mMotionEventToZoomRatioConverter.reset(mLocalFgService.getZoomRatio(),
                 mLocalFgService.getCameraInfo().getZoomRatioRange());
@@ -594,6 +642,7 @@ public class DeviceAsWebcamPreview extends Activity {
         }
 
         mLocalFgService.switchCamera(cameraId);
+        setToggleCameraContentDescription();
         mMotionEventToZoomRatioConverter.reset(mLocalFgService.getZoomRatio(),
                 mLocalFgService.getCameraInfo().getZoomRatioRange());
         setupZoomRatioSeekBar();

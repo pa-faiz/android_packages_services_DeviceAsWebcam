@@ -99,10 +99,7 @@ public class CameraController {
     // Camera availability states
     enum CameraAvailabilityState {
         AVAILABLE,
-        IN_USE,
-        WAITING_FOR_AVAILABLE,
-        WAITING_FOR_UNAVAILABLE,
-        EVICTED
+        UNAVAILABLE
     };
 
     private static final int MAX_BUFFERS = 4;
@@ -116,6 +113,7 @@ public class CameraController {
     private CameraId mFrontCameraId = null;
 
     private ImageReader mImgReader;
+    private Object mImgReaderLock = new Object();
     private ImageWriter mImageWriter;
 
     // current camera session state
@@ -188,40 +186,35 @@ public class CameraController {
                 Log.v(TAG, "Camera device opened, creating capture session now");
             }
             mCameraDevice = cameraDevice;
-            mCameraAvailabilityState.put(cameraDevice.getId(), CameraAvailabilityState.IN_USE);
             mReadyToStream.open();
         }
 
         @Override
         public void onDisconnected(CameraDevice cameraDevice) {
             if (VERBOSE) {
-                Log.v(TAG, "onDisconnected: " + cameraDevice.getId() + " camera available state "
-                        + mCameraAvailabilityState.get(cameraDevice.getId()));
+                Log.v(TAG, "onDisconnected: " + cameraDevice.getId() +
+                        " camera available state " +
+                        mCameraAvailabilityState.get(cameraDevice.getId()));
             }
-            synchronized (mSerializationLock) {
-                // In this case we got disconnected due to an eviction, in the other case the camera
-                // got disconnected to an onError callback - for example when there is a camera HAL
-                // or service crash.
-                if (mCameraAvailabilityState.get(cameraDevice.getId()) !=
-                        CameraAvailabilityState.WAITING_FOR_AVAILABLE) {
-                    mCameraAvailabilityState.put(cameraDevice.getId(),
-                            CameraAvailabilityState.EVICTED);
-                }
-                mCameraDevice = null;
-                stopStreamingAltogetherLocked(/*closeImageReader*/false);
-                if (mStartCaptureWebcamStream.get()) {
-                    startShowingCameraUnavailableLogo();
-                }
-            }
+            handleDisconnected();
         }
 
+        private void handleDisconnected() {
+            mServiceEventsExecutor.execute(() -> {
+                synchronized (mSerializationLock) {
+                    mCameraDevice = null;
+                    stopStreamingAltogetherLocked(/*closeImageReader*/false);
+                    if (mStartCaptureWebcamStream.get()) {
+                        startShowingCameraUnavailableLogo();
+                    }
+                }
+            });
+        }
         @Override
         public void onError(@NonNull CameraDevice cameraDevice, int error) {
             if (VERBOSE) {
-                Log.e(TAG, "Camera : onError " + error);
+                Log.e(TAG, "Camera id  " + cameraDevice.getId() + ": onError " + error);
             }
-            mCameraAvailabilityState.put(
-                    cameraDevice.getId(), CameraAvailabilityState.WAITING_FOR_AVAILABLE);
             mReadyToStream.open();
             if (mStartCaptureWebcamStream.get()) {
                 startShowingCameraUnavailableLogo();
@@ -255,52 +248,30 @@ public class CameraController {
                 }
             };
 
-    // For the camera availability callbacks, we need to keep track of the 'state'
-    // of callbacks since the camera api sends clients the following order of callbacks once
-    // it gets evicted by a higher priority callback :
-    //  1. onDisconnected()
-    //  2. onCameraAvailable() followed immediately by
-    //  3. onCameraUnavailable().
-    //  4. When the higher priority client closes the camera, the lower priority client also
-    //     receives an onCameraAvailable() callback.
-    //  So in order to distinguish between the onCameraAvailable() callbacks in 2. and 4. we need to
-    //  keep track of the state we're in.
     private CameraManager.AvailabilityCallback mCameraAvailabilityCallbacks =
             new CameraManager.AvailabilityCallback() {
         @Override
         public void onCameraAvailable(String cameraId) {
-            mCameraAvailabilityState.putIfAbsent(cameraId, CameraAvailabilityState.AVAILABLE);
-            switch (mCameraAvailabilityState.get(cameraId)) {
-                case EVICTED:
-                    mCameraAvailabilityState.put(
-                            cameraId, CameraAvailabilityState.WAITING_FOR_UNAVAILABLE);
-                    break;
-                case WAITING_FOR_AVAILABLE:
-                    if (mStartCaptureWebcamStream.get() && cameraId.equals(
-                            mCameraId.mainCameraId)) {
-                        if (VERBOSE) {
-                            Log.v(TAG, "Camera is available : starting webcam stream for camera id "
-                                    + cameraId);
-                        }
-                        stopShowingCameraUnavailableLogo();
-                        setWebcamStreamConfig(mStreamConfigs.isMjpeg, mStreamConfigs.width,
-                                mStreamConfigs.height, mStreamConfigs.fps);
-                        startWebcamStreaming();
-                        mCameraAvailabilityState.put(
-                                cameraId, CameraAvailabilityState.IN_USE);
-                    } else {
-                        mCameraAvailabilityState.put(
-                            cameraId, CameraAvailabilityState.AVAILABLE);
-                    }
-                    break;
-                default:
-                    mCameraAvailabilityState.put(
-                        cameraId, CameraAvailabilityState.AVAILABLE);
-            }
+            mCameraAvailabilityState.put(cameraId, CameraAvailabilityState.AVAILABLE);
             if (VERBOSE) {
-                Log.v(TAG, "onCameraAvailable: " + cameraId + " camera available state "
-                        + mCameraAvailabilityState.get(cameraId));
+                Log.v(TAG, "onCameraAvailable: " + cameraId);
             }
+            // We want to attempt to start webcam streaming when :
+            // webcam was already streaming and the camera that was streaming became available.
+            // The attempt to start streaming the camera may succeed or fail. If it fails,
+            // (for example: if the camera is available but another client is using a camera which
+            // cannot be opened concurrently with mCameraId), it'll be handled by the onError
+            // callback.
+            if (mStartCaptureWebcamStream.get() &&
+                    mCameraAvailabilityState.get(mCameraId.mainCameraId) ==
+                            CameraAvailabilityState.AVAILABLE) {
+                if (VERBOSE) {
+                    Log.v(TAG, "Camera available : try starting webcam stream for camera id "
+                            + mCameraId.mainCameraId);
+                }
+                handleOnCameraAvailable();
+            }
+
         }
 
         @Override
@@ -310,7 +281,7 @@ public class CameraController {
             if (VERBOSE) {
                 Log.v(TAG, "Camera id " + cameraId + " unavailable");
             }
-            mCameraAvailabilityState.put(cameraId, CameraAvailabilityState.WAITING_FOR_AVAILABLE);
+            mCameraAvailabilityState.put(cameraId, CameraAvailabilityState.UNAVAILABLE);
         }
     };
 
@@ -318,31 +289,41 @@ public class CameraController {
             new ImageReader.OnImageAvailableListener() {
                 @Override
                 public void onImageAvailable(ImageReader reader) {
+                    Image image;
+                    HardwareBuffer hardwareBuffer;
+                    long ts;
                     DeviceAsWebcamFgService service = mServiceWeak.get();
-                    if (service == null) {
-                        Log.e(TAG, "Service is dead, what ?");
-                        return;
-                    }
-                    if (mImageMap.size() >= MAX_BUFFERS) {
+                    synchronized (mImgReaderLock) {
+                        if (reader != mImgReader) {
+                            return;
+                        }
+                        if (service == null) {
+                            Log.e(TAG, "Service is dead, what ?");
+                            return;
+                        }
+                        if (mImageMap.size() >= MAX_BUFFERS) {
                             Log.w(TAG, "Too many buffers acquired in onImageAvailable, returning");
                             return;
-                    }
-                    // Get native HardwareBuffer from the latest image and send it to
-                    // the native layer for the encoder to process.
-                    // Acquire latest Image and get the HardwareBuffer
-                    Image image = reader.acquireLatestImage();
-                    if (VERBOSE) {
-                        Log.v(TAG, "Got acquired Image in onImageAvailable callback for reader "
-                                + reader);
-                    }
-                    if (image == null) {
-                        if (VERBOSE) {
-                            Log.e(TAG, "More images than MAX acquired ?");
                         }
-                        return;
+                        // Get native HardwareBuffer from the next image (we should never
+                        // accumulate images since we're not doing any compute work on the
+                        // imageReader thread) and
+                        // send it to the native layer for the encoder to process.
+                        // Acquire latest Image and get the HardwareBuffer
+                        image = reader.acquireNextImage();
+                        if (VERBOSE) {
+                            Log.v(TAG, "Got acquired Image in onImageAvailable callback for reader "
+                                    + reader);
+                        }
+                        if (image == null) {
+                            if (VERBOSE) {
+                                Log.e(TAG, "More images than MAX acquired ?");
+                            }
+                            return;
+                        }
+                        ts = image.getTimestamp();
+                        hardwareBuffer = image.getHardwareBuffer();
                     }
-                    long ts = image.getTimestamp();
-                    HardwareBuffer hardwareBuffer = image.getHardwareBuffer();
                     mImageMap.put(ts, new ImageAndBuffer(image, hardwareBuffer));
                     // Callback into DeviceAsWebcamFgService to encode image
                     if ((!mStartCaptureWebcamStream.get()) || (service.nativeEncodeImage(
@@ -693,16 +674,18 @@ public class CameraController {
         synchronized (mSerializationLock) {
             long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
             mStreamConfigs = new StreamConfigs(mjpeg, width, height, fps);
-            if (mImgReader != null) {
-                mImgReader.close();
+            synchronized (mImgReaderLock) {
+                if (mImgReader != null) {
+                    mImgReader.close();
+                }
+                mImgReader = new ImageReader.Builder(width, height)
+                        .setMaxImages(MAX_BUFFERS)
+                        .setDefaultHardwareBufferFormat(HardwareBuffer.YCBCR_420_888)
+                        .setUsage(usage)
+                        .build();
+                mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
+                        mImageReaderHandler);
             }
-            mImgReader = new ImageReader.Builder(width, height)
-                    .setMaxImages(MAX_BUFFERS)
-                    .setDefaultHardwareBufferFormat(HardwareBuffer.YCBCR_420_888)
-                    .setUsage(usage)
-                    .build();
-            mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
-                    mImageReaderHandler);
         }
     }
 
@@ -714,10 +697,32 @@ public class CameraController {
         rgbaBuffer.put(mCombinedBitmapBytes);
     }
 
+    private void handleOnCameraAvailable() {
+        // Offload to mServiceEventsExecutor since any camera operations which require
+        // mSerializationLock should be performed on mServiceEventsExecutor thread.
+        mServiceEventsExecutor.execute(() -> {
+            synchronized (mSerializationLock) {
+                if (mCameraDevice != null) {
+                    return;
+                }
+                stopShowingCameraUnavailableLogo();
+                setWebcamStreamConfig(mStreamConfigs.isMjpeg, mStreamConfigs.width,
+                        mStreamConfigs.height, mStreamConfigs.fps);
+                startWebcamStreamingNoOffload();
+            }
+        });
+    }
+
+    /**
+     * Stops showing the camera unavailable logo. Should only be called on the
+     * mServiceEventsExecutor thread
+     */
     private void stopShowingCameraUnavailableLogo() {
         // destroy the executor since camera getting evicted would be a rare occurrence
         synchronized (mSerializationLock) {
-            mImageWriterEventsExecutor.shutdown();
+            if (mImageWriterEventsExecutor != null) {
+                mImageWriterEventsExecutor.shutdown();
+            }
             mImageWriterEventsExecutor = null;
             mImageWriter = null;
             mCombinedBitmapBytes = null;
@@ -725,21 +730,33 @@ public class CameraController {
     }
 
     private void startShowingCameraUnavailableLogo() {
+        mServiceEventsExecutor.execute(() -> {
+           startShowingCameraUnavailableLogoNoOffload();
+        });
+    }
+
+    /**
+     * Starts showing the camera unavailable logo. Should only be called on the
+     * mServiceEventsExecutor thread
+     */
+    private void startShowingCameraUnavailableLogoNoOffload() {
         synchronized (mSerializationLock) {
             setupBitmaps(mStreamConfigs.width, mStreamConfigs.height);
             long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
-            if (mImgReader != null) {
-                mImgReader.close();
-            }
-            mImgReader = new ImageReader.Builder(
-                            mStreamConfigs.width, mStreamConfigs.height)
-                    .setMaxImages(MAX_BUFFERS)
-                    .setDefaultHardwareBufferFormat(HardwareBuffer.RGBA_8888)
-                    .setUsage(usage)
-                    .build();
+            synchronized (mImgReaderLock) {
+                if (mImgReader != null) {
+                    mImgReader.close();
+                }
+                mImgReader = new ImageReader.Builder(
+                         mStreamConfigs.width, mStreamConfigs.height)
+                        .setMaxImages(MAX_BUFFERS)
+                        .setDefaultHardwareBufferFormat(HardwareBuffer.RGBA_8888)
+                        .setUsage(usage)
+                        .build();
 
-            mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
-                    mImageReaderHandler);
+                mImgReader.setOnImageAvailableListener(mOnImageAvailableListener,
+                        mImageReaderHandler);
+            }
             mImageWriter = ImageWriter.newInstance(mImgReader.getSurface(), MAX_BUFFERS);
             // In effect, the webcam stream has started
             mImageWriterEventsExecutor = Executors.newScheduledThreadPool(1);
@@ -757,7 +774,7 @@ public class CameraController {
     }
 
     /**
-     * Must be called with mSerializationLock held.
+     * Must be called with mSerializationLock held on mServiceExecutor thread.
      */
     private void openCameraBlocking() {
         if (mCameraManager == null) {
@@ -776,7 +793,7 @@ public class CameraController {
             mCameraManager.openCamera(mCameraId.mainCameraId, mCameraCallbacksExecutor,
                     mCameraStateCallback);
         } catch (CameraAccessException e) {
-            Log.e(TAG, "openCamera failed for cameraId : " + mCameraId, e);
+            Log.e(TAG, "openCamera failed for cameraId : " + mCameraId.mainCameraId, e);
             startShowingCameraUnavailableLogo();
         }
         mReadyToStream.block();
@@ -815,6 +832,8 @@ public class CameraController {
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
         } catch (CameraAccessException e) {
             Log.e(TAG, "createCaptureRequest failed", e);
+            stopStreamingAltogetherLocked();
+            startShowingCameraUnavailableLogoNoOffload();
             return null;
         }
 
@@ -929,6 +948,7 @@ public class CameraController {
         mPreviewRequestBuilder.addTarget(mPreviewSurface);
         mOutputConfigurations = Arrays.asList(mPreviewOutputConfiguration,
                 mWebcamOutputConfiguration);
+
         mCurrentState = CameraStreamingState.PREVIEW_AND_WEBCAM_STREAMING;
         createCaptureSessionBlocking();
     }
@@ -1040,40 +1060,57 @@ public class CameraController {
             mPreviewSizeChangeListener.accept(suitablePreviewSize);
         }
     }
-
     public void startWebcamStreaming() {
-        // Started on a background thread since we don't want to be blocking the service's main
-        // thread (we call blocking camera open in these methods internally)
         mServiceEventsExecutor.execute(() -> {
-            mStartCaptureWebcamStream.set(true);
-            synchronized (mSerializationLock) {
+            // Started on a background thread since we don't want to be blocking the service's main
+            // thread (we call blocking camera open in these methods internally)
+            startWebcamStreamingNoOffload();
+        });
+    }
+
+    /**
+     * Starts webcam streaming. This should only be called on the service events executor thread.
+     */
+    public void startWebcamStreamingNoOffload() {
+        mStartCaptureWebcamStream.set(true);
+        synchronized (mSerializationLock) {
+            synchronized (mImgReaderLock) {
                 if (mImgReader == null) {
                     Log.e(TAG,
                             "Webcam streaming requested without ImageReader initialized");
                     return;
                 }
-                switch (mCurrentState) {
-                    // Our current state could also be webcam streaming and we want to start the
-                    // camera again - example : we never had the camera and were streaming the
-                    // camera unavailable logo - when camera becomes available we actually want to
-                    // start streaming camera frames.
-                    case WEBCAM_STREAMING:
-                    case NO_STREAMING:
-                        setupWebcamOnlyStreamAndOpenCameraLocked();
-                        break;
-                    case PREVIEW_STREAMING:
-                        adjustPreviewOutputConfiguration();
-                        // Its okay to recreate an already running camera session with
-                        // preview since the 'glitch' that we see will not be on the webcam
-                        // stream.
-                        setupWebcamStreamAndReconfigureSessionLocked();
-                        break;
-                    case PREVIEW_AND_WEBCAM_STREAMING:
-                        Log.e(TAG, "Incorrect current state for startWebcamStreaming "
-                                + mCurrentState);
-                }
             }
-        });
+            switch (mCurrentState) {
+                // Our current state could also be webcam streaming and we want to start the
+                // camera again - example : we never had the camera and were streaming the
+                // camera unavailable logo - when camera becomes available we actually want to
+                // start streaming camera frames.
+                case WEBCAM_STREAMING:
+                case NO_STREAMING:
+                    setupWebcamOnlyStreamAndOpenCameraLocked();
+                    break;
+                case PREVIEW_STREAMING:
+                    adjustPreviewOutputConfiguration();
+                    // Its okay to recreate an already running camera session with
+                    // preview since the 'glitch' that we see will not be on the webcam
+                    // stream.
+                    setupWebcamStreamAndReconfigureSessionLocked();
+                    break;
+                case PREVIEW_AND_WEBCAM_STREAMING:
+                    if (mCameraDevice == null) {
+                        // We had been evicted and were streaming fake webcam streams,
+                        // preview activity  was selected, and then camera became available.
+                        setupWebcamOnlyStreamAndOpenCameraLocked();
+                        if (mPreviewSurface != null) {
+                            setupPreviewStreamAlongsideWebcamStreamLocked(mPreviewSurface);
+                        }
+                    } else {
+                        Log.e(TAG, "Incorrect current state for startWebcamStreaming "
+                                + mCurrentState + " since webcam and preview already streaming");
+                    }
+            }
+        }
     }
 
     private void stopPreviewStreamOnlyLocked() {
@@ -1132,9 +1169,11 @@ public class CameraController {
             Log.v(TAG, "StopStreamingAltogether");
         }
         mCurrentState = CameraStreamingState.NO_STREAMING;
-        if (closeImageReader && mImgReader != null) {
-            mImgReader.close();
-            mImgReader = null;
+        synchronized (mImgReaderLock) {
+            if (closeImageReader && mImgReader != null) {
+                mImgReader.close();
+                mImgReader = null;
+            }
         }
         if (mCameraDevice != null) {
             mCameraDevice.close();
@@ -1195,7 +1234,10 @@ public class CameraController {
                 config.setPhysicalCameraId(mCameraId.physicalCameraId);
             }
         }
-
+        // In case we're fake streaming camera frames.
+        if (mCameraDevice == null) {
+            return;
+        }
         try {
             mCameraDevice.createCaptureSession(
                     new SessionConfiguration(
@@ -1205,11 +1247,13 @@ public class CameraController {
             mCaptureSessionReady.close();
         } catch (CameraAccessException e) {
             Log.e(TAG, "createCaptureSession failed", e);
+            stopStreamingAltogetherLocked();
+            startShowingCameraUnavailableLogoNoOffload();
         }
     }
 
     public void returnImage(long timestamp) {
-        ImageAndBuffer imageAndBuffer = mImageMap.remove(timestamp);
+        ImageAndBuffer imageAndBuffer = mImageMap.get(timestamp);
         if (imageAndBuffer == null) {
             Log.e(TAG, "Image with timestamp " + timestamp +
                     " was never encoded / already returned");
@@ -1217,6 +1261,7 @@ public class CameraController {
         }
         imageAndBuffer.buffer.close();
         imageAndBuffer.image.close();
+        mImageMap.remove(timestamp);
         if (VERBOSE) {
             Log.v(TAG, "Returned image " + timestamp);
         }
@@ -1303,6 +1348,10 @@ public class CameraController {
         }
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
+                if (mCameraDevice == null) {
+                    // Its possible the preview screen is up before the camera device is opened.
+                    return;
+                }
                 mCaptureSession.close();
                 if (mCameraInfo != null) {
                     mRotationProvider.updateSensorOrientation(mCameraInfo.getSensorOrientation(),
@@ -1348,26 +1397,39 @@ public class CameraController {
      * <p>If the webcam stream doesn't exist, find the largest 16:9 supported output size which is
      * not larger than 1080p. If the webcam stream exists, find the largest supported output size
      * which matches the aspect ratio of the webcam stream size and is not larger than the
-     * display size or 1080p, whichever is smaller.
+     * display size, 1080p, or the webcam stream resolution, whichever is smallest.
      */
     public Size getSuitablePreviewSize() {
         if (mCameraId == null) {
             Log.e(TAG, "No camera is found on the device.");
             return null;
         }
-        Size s1080p = new Size(1920, 1080);
-        // PREVIEW is max(1080p, display size) - this is the max size of preview streams that is
-        // guaranteed to be supported, when another YUV stream (here the webcam stream) is also
-        // configured.
-        Size maxPreviewSize =
-                (1920 * 1080)  >
-                        (mDisplaySize.getWidth() * mDisplaySize.getHeight()) ?
-                                mDisplaySize : s1080p;
+
+        final Size s1080p = new Size(1920, 1080);
+        Size maxPreviewSize = s1080p;
+
+        // For PREVIEW, choose the smallest of webcam stream size, display size, and 1080p. This
+        // is guaranteed to be supported with a YUV stream.
+        if (mImgReader != null) {
+            maxPreviewSize = new Size(mImgReader.getWidth(), mImgReader.getHeight());
+        }
+
+        if (numPixels(maxPreviewSize) > numPixels(s1080p)) {
+            maxPreviewSize = s1080p;
+        }
+
+        if (numPixels(maxPreviewSize) > numPixels(mDisplaySize)) {
+            maxPreviewSize = mDisplaySize;
+        }
 
         // If webcam stream exists, find an output size matching its aspect ratio. Otherwise, find
         // an output size with 16:9 aspect ratio.
-        final Rational targetAspectRatio = new Rational(maxPreviewSize.getWidth(),
-                maxPreviewSize.getHeight());
+        final Rational targetAspectRatio;
+        if (mImgReader != null) {
+            targetAspectRatio = new Rational(mImgReader.getWidth(), mImgReader.getHeight());
+        } else {
+            targetAspectRatio = new Rational(s1080p.getWidth(), s1080p.getHeight());
+        }
 
         StreamConfigurationMap map = getCameraCharacteristic(mCameraId.mainCameraId,
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
@@ -1384,16 +1446,20 @@ public class CameraController {
             return null;
         }
 
+        Size finalMaxPreviewSize = maxPreviewSize;
         Size previewSize = Arrays.stream(outputSizes)
                 .filter(size -> targetAspectRatio.equals(
                         new Rational(size.getWidth(), size.getHeight())))
-                .filter(size -> size.getWidth() * size.getHeight()
-                        <= maxPreviewSize.getWidth() * maxPreviewSize.getHeight())
-                .max(Comparator.comparingInt(s -> s.getWidth() * s.getHeight()))
+                .filter(size -> numPixels(size) <= numPixels(finalMaxPreviewSize))
+                .max(Comparator.comparingInt(CameraController::numPixels))
                 .orElse(null);
 
         Log.d(TAG, "Suitable preview size is " + previewSize);
         return previewSize;
+    }
+
+    private static int numPixels(Size size) {
+        return size.getWidth() * size.getHeight();
     }
 
     /**
