@@ -48,11 +48,10 @@
 
             <ImageView
                 android:id="@+id/focus_indicator"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_width="@dimen/focus_indicator_size"
+                android:layout_height="@dimen/focus_indicator_size"
                 android:contentDescription="@null"
-                android:visibility="gone"
-                android:background="@drawable/ic_filter_center_focus" />
+                android:visibility="gone" />
         </androidx.cardview.widget.CardView>
     </FrameLayout>
 
@@ -79,16 +78,31 @@
 
         <androidx.constraintlayout.widget.ConstraintLayout
             android:id="@+id/zoom_ui_container"
-            android:layout_width="wrap_content"
-            android:layout_height="match_parent"
+            android:layout_width="0dp"
+            android:layout_height="0dp"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintTop_toTopOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintEnd_toStartOf="@id/toggle_camera_button">
             <com.android.DeviceAsWebcam.view.ZoomController
                 android:id="@+id/zoom_ui_controller"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"/>
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintWidth_max="@dimen/zoom_seekbar_width"/>
         </androidx.constraintlayout.widget.ConstraintLayout>
     </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <com.android.DeviceAsWebcam.view.SwitchCameraSelectorView
+        android:id="@+id/switch_camera_selector_view"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

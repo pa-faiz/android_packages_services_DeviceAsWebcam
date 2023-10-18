@@ -16,18 +16,26 @@
 
 package com.android.DeviceAsWebcam;
 
+import static android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK;
+
+import android.accessibilityservice.AccessibilityServiceInfo;
 import android.animation.ObjectAnimator;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Insets;
-import android.graphics.Matrix;
-import android.graphics.Rect;
+import android.graphics.Paint;
 import android.graphics.SurfaceTexture;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.ShapeDrawable;
+import android.graphics.drawable.shapes.OvalShape;
 import android.hardware.camera2.CameraCharacteristics;
-import android.hardware.camera2.params.MeteringRectangle;
+import android.hardware.camera2.CameraMetadata;
 import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.IBinder;
@@ -37,6 +45,7 @@ import android.util.Size;
 import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
@@ -44,14 +53,19 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.accessibility.AccessibilityManager;
 import android.view.animation.AccelerateDecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 
 import androidx.cardview.widget.CardView;
 
+import com.android.DeviceAsWebcam.view.SelectorListItemData;
+import com.android.DeviceAsWebcam.view.SwitchCameraSelectorView;
 import com.android.DeviceAsWebcam.view.ZoomController;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -60,8 +74,6 @@ public class DeviceAsWebcamPreview extends Activity {
     private static final String TAG = DeviceAsWebcamPreview.class.getSimpleName();
     private static final boolean VERBOSE = Log.isLoggable(TAG, Log.VERBOSE);
     private static final int ROTATION_ANIMATION_DURATION_MS = 300;
-    private static final int FOCUS_INDICATOR_AUTO_HIDE_DURATION_MS = 1000;
-    private static final float METERING_RECTANGLE_SIZE = 0.15f;
 
     private final Executor mThreadExecutor = Executors.newFixedThreadPool(2);
     private final ConditionVariable mServiceReady = new ConditionVariable();
@@ -69,14 +81,16 @@ public class DeviceAsWebcamPreview extends Activity {
     private boolean mTextureViewSetup = false;
     private Size mPreviewSize;
     private DeviceAsWebcamFgService mLocalFgService;
+    private AccessibilityManager mAccessibilityManager;
 
     private FrameLayout mTextureViewContainer;
     private CardView mTextureViewCard;
     private TextureView mTextureView;
     private View mFocusIndicator;
-    private Runnable mAutoHideFocusIndicator = () -> mFocusIndicator.setVisibility(View.GONE);
     private ZoomController mZoomController = null;
     private ImageButton mToggleCameraButton;
+    private SwitchCameraSelectorView mSwitchCameraSelectorView;
+    private List<SelectorListItemData> mSelectorListItemDataList;
     // A listener to monitor the preview size change events. This might be invoked when toggling
     // camera or the webcam stream is started after the preview stream.
     Consumer<Size> mPreviewSizeChangeListener = size -> runOnUiThread(() -> {
@@ -84,6 +98,41 @@ public class DeviceAsWebcamPreview extends Activity {
                 setTextureViewScale();
             }
     );
+
+    // Listener for when Accessibility service are enabled or disabled.
+    AccessibilityManager.AccessibilityServicesStateChangeListener mAccessibilityListener =
+            accessibilityManager -> {
+                List<AccessibilityServiceInfo> services =
+                        accessibilityManager.getEnabledAccessibilityServiceList(FEEDBACK_ALL_MASK);
+                boolean areServicesEnabled = !services.isEmpty();
+                runOnUiThread(() ->
+                        mZoomController.onAccessibilityServicesEnabled(areServicesEnabled));
+            };
+
+
+    /**
+     * {@link View.OnLayoutChangeListener} to add to
+     * {@link DeviceAsWebcamPreview#mTextureViewContainer} for when we need to know
+     * when changes to the view are committed.
+     * <p>
+     * NOTE: This removes itself as a listener after one call to prevent spurious callbacks
+     *       once the texture view has been resized.
+     */
+    View.OnLayoutChangeListener mTextureViewContainerLayoutListener =
+            new View.OnLayoutChangeListener() {
+                @Override
+                public void onLayoutChange(View view, int left, int top, int right, int bottom,
+                                           int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                    // Remove self to prevent further calls to onLayoutChange.
+                    view.removeOnLayoutChangeListener(this);
+                    // Update the texture view to fit the new bounds.
+                    runOnUiThread(() -> {
+                        if (mPreviewSize != null) {
+                            setTextureViewScale();
+                        }
+                    });
+                }
+            };
 
     /**
      * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
@@ -103,22 +152,39 @@ public class DeviceAsWebcamPreview extends Activity {
                         if (!mTextureViewSetup) {
                             setupTextureViewLayout();
                         }
-                        if (mLocalFgService != null) {
-                            mLocalFgService.setOnDestroyedCallback(() -> onServiceDestroyed());
-                            if (mPreviewSize != null) {
-                                mLocalFgService.setPreviewSurfaceTexture(texture, mPreviewSize,
-                                        mPreviewSizeChangeListener);
-                                if (mLocalFgService.canToggleCamera()) {
-                                    mToggleCameraButton.setVisibility(View.VISIBLE);
-                                    mToggleCameraButton.setOnClickListener(v -> toggleCamera());
-                                } else {
-                                    mToggleCameraButton.setVisibility(View.GONE);
-                                }
-                                rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
-                                mLocalFgService.setRotationUpdateListener(
-                                        rotation -> rotateUiByRotationDegrees(rotation));
-                            }
+
+                        if (mLocalFgService == null) {
+                            return;
                         }
+                        mLocalFgService.setOnDestroyedCallback(() -> onServiceDestroyed());
+
+                        if (mPreviewSize == null) {
+                            return;
+                        }
+                        mLocalFgService.setPreviewSurfaceTexture(texture, mPreviewSize,
+                                mPreviewSizeChangeListener);
+                        List<CameraId> availableCameraIds =
+                                mLocalFgService.getAvailableCameraIds();
+                        if (availableCameraIds != null && availableCameraIds.size() > 1) {
+                            setupSwitchCameraSelector();
+                            mToggleCameraButton.setVisibility(View.VISIBLE);
+                            if (canToggleCamera()) {
+                                mToggleCameraButton.setOnClickListener(v -> toggleCamera());
+                            } else {
+                                mToggleCameraButton.setOnClickListener(v -> {
+                                    mSwitchCameraSelectorView.show();
+                                });
+                            }
+                            mToggleCameraButton.setOnLongClickListener(v -> {
+                                mSwitchCameraSelectorView.show();
+                                return true;
+                            });
+                        } else {
+                            mToggleCameraButton.setVisibility(View.GONE);
+                        }
+                        rotateUiByRotationDegrees(mLocalFgService.getCurrentRotation());
+                        mLocalFgService.setRotationUpdateListener(
+                                rotation -> rotateUiByRotationDegrees(rotation));
                     });
                 }
 
@@ -242,6 +308,12 @@ public class DeviceAsWebcamPreview extends Activity {
         GestureDetector tapToFocusGestureDetector = new GestureDetector(getApplicationContext(),
                 mTapToFocusListener);
 
+        // Restores the focus indicator if tap-to-focus points exist
+        float[] tapToFocusPoints = mLocalFgService.getTapToFocusPoints();
+        if (tapToFocusPoints != null) {
+            showFocusIndicator(tapToFocusPoints);
+        }
+
         mTextureView.setOnTouchListener(
                 (view, event) -> {
                     mMotionEventToZoomRatioConverter.onTouchEvent(event);
@@ -258,6 +330,9 @@ public class DeviceAsWebcamPreview extends Activity {
                     }
                     mMotionEventToZoomRatioConverter.setZoomRatio(value);
                 });
+        if (mAccessibilityManager != null) {
+            mAccessibilityListener.onAccessibilityServicesStateChanged(mAccessibilityManager);
+        }
     }
 
     private void setupZoomRatioSeekBar() {
@@ -267,6 +342,27 @@ public class DeviceAsWebcamPreview extends Activity {
 
         mZoomController.setSupportedZoomRatioRange(
                 mLocalFgService.getCameraInfo().getZoomRatioRange());
+    }
+
+    private void setupSwitchCameraSelector() {
+        if (mLocalFgService == null || mLocalFgService.getCameraInfo() == null) {
+            return;
+        }
+        setToggleCameraContentDescription();
+        mSelectorListItemDataList = createSelectorItemDataList();
+
+        mSwitchCameraSelectorView.init(getLayoutInflater(), mSelectorListItemDataList);
+        mSwitchCameraSelectorView.setRotation(mLocalFgService.getCurrentRotation());
+        mSwitchCameraSelectorView.setOnCameraSelectedListener(cameraId -> switchCamera(cameraId));
+        mSwitchCameraSelectorView.updateSelectedItem(
+                mLocalFgService.getCameraInfo().getCameraId());
+
+        // Dynamically enable/disable the toggle button and zoom controller so that the behaviors
+        // under accessibility mode will be correct.
+        mSwitchCameraSelectorView.setOnVisibilityChangedListener(visibility -> {
+            mToggleCameraButton.setEnabled(visibility != View.VISIBLE);
+            mZoomController.setEnabled(visibility != View.VISIBLE);
+        });
     }
 
     private void rotateUiByRotationDegrees(int rotation) {
@@ -285,6 +381,7 @@ public class DeviceAsWebcamPreview extends Activity {
                     HapticFeedbackConstants.GESTURE_THRESHOLD_ACTIVATE);
 
             mZoomController.setTextDisplayRotation(finalRotation, ROTATION_ANIMATION_DURATION_MS);
+            mSwitchCameraSelectorView.setRotation(finalRotation);
         });
     }
 
@@ -334,25 +431,62 @@ public class DeviceAsWebcamPreview extends Activity {
         mTextureViewCard = findViewById(R.id.texture_view_card);
         mTextureView = findViewById(R.id.texture_view);
         mFocusIndicator = findViewById(R.id.focus_indicator);
+        mFocusIndicator.setBackground(createFocusIndicatorDrawable());
         mToggleCameraButton = findViewById(R.id.toggle_camera_button);
         mZoomController = findViewById(R.id.zoom_ui_controller);
+        mSwitchCameraSelectorView = findViewById(R.id.switch_camera_selector_view);
+
+        mAccessibilityManager = getSystemService(AccessibilityManager.class);
+        if (mAccessibilityManager != null) {
+            mAccessibilityManager.addAccessibilityServicesStateChangeListener(
+                    mAccessibilityListener);
+        }
 
         // Update view to allow for status bar. This let's us keep a consistent background color
         // behind the statusbar.
         mTextureViewContainer.setOnApplyWindowInsetsListener((view, inset) -> {
-            Insets statusBarInset = inset.getInsets(WindowInsets.Type.statusBars());
+            Insets cutoutInset = inset.getInsets(WindowInsets.Type.displayCutout());
+            int minMargin = (int) getResources().getDimension(R.dimen.preview_margin_top_min);
+
             ViewGroup.MarginLayoutParams layoutParams =
                     (ViewGroup.MarginLayoutParams) mTextureViewContainer.getLayoutParams();
-            // This callback will be called every time the window insets change,
-            // including when the status bar is hidden. So apply the max statusbar height
-            // we have seen
-            layoutParams.topMargin = Math.max(layoutParams.topMargin, statusBarInset.top);
-            mTextureViewContainer.setLayoutParams(layoutParams);
+            // Set the top margin to accommodate the cutout. However, if the cutout is
+            // very small, add a small margin to prevent the preview from going too close to
+            // the edge of the device.
+            int newMargin = Math.max(minMargin, cutoutInset.top);
+            if (newMargin != layoutParams.topMargin) {
+                layoutParams.topMargin = Math.max(minMargin, cutoutInset.top);
+                mTextureViewContainer.setLayoutParams(layoutParams);
+                // subscribe to layout changes of the texture view container so we can
+                // resize the texture view once the container has been drawn with the new
+                // margins
+                mTextureViewContainer
+                        .addOnLayoutChangeListener(mTextureViewContainerLayoutListener);
+            }
             return WindowInsets.CONSUMED;
         });
 
         bindService(new Intent(this, DeviceAsWebcamFgService.class), 0, mThreadExecutor,
                 mConnection);
+    }
+
+    private Drawable createFocusIndicatorDrawable() {
+        int indicatorSize = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size);
+        Bitmap bitmap = Bitmap.createBitmap(indicatorSize, indicatorSize, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+
+        OvalShape ovalShape = new OvalShape();
+        ShapeDrawable shapeDrawable = new ShapeDrawable(ovalShape);
+        Paint paint = shapeDrawable.getPaint();
+        paint.setAntiAlias(true);
+        paint.setColor(getResources().getColor(R.color.focus_indicator_background_color, null));
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(3);
+
+        int circleRadius = indicatorSize / 2;
+        canvas.drawCircle(circleRadius, circleRadius, circleRadius - 1, paint);
+
+        return new BitmapDrawable(getResources(), bitmap);
     }
 
     private void hideSystemUiAndActionBar() {
@@ -406,14 +540,83 @@ public class DeviceAsWebcamPreview extends Activity {
         }
         super.onPause();
     }
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (mLocalFgService == null || (keyCode != KeyEvent.KEYCODE_VOLUME_DOWN
+                && keyCode != KeyEvent.KEYCODE_VOLUME_UP)) {
+            return super.onKeyDown(keyCode, event);
+        }
+
+        float zoomRatio = mLocalFgService.getZoomRatio();
+
+        // Uses volume key events to adjust zoom ratio
+        if ((keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)){
+            zoomRatio -= 0.1f;
+        } else {
+            zoomRatio += 0.1f;
+        }
+
+        // Clamps the zoom ratio in the supported range
+        Range<Float> zoomRatioRange = mLocalFgService.getCameraInfo().getZoomRatioRange();
+        zoomRatio = Math.min(Math.max(zoomRatio, zoomRatioRange.getLower()),
+                zoomRatioRange.getUpper());
+
+        // Updates the new value to all related controls
+        mLocalFgService.setZoomRatio(zoomRatio);
+        mZoomController.setZoomRatio(zoomRatio, ZoomController.ZOOM_UI_SEEK_BAR_MODE);
+        mMotionEventToZoomRatioConverter.setZoomRatio(zoomRatio);
+
+        return true;
+    }
 
     @Override
     public void onDestroy() {
+        if (mAccessibilityManager != null) {
+            mAccessibilityManager.removeAccessibilityServicesStateChangeListener(
+                    mAccessibilityListener);
+        }
         if (mLocalFgService != null) {
             mLocalFgService.setOnDestroyedCallback(null);
         }
         unbindService(mConnection);
         super.onDestroy();
+    }
+
+    /**
+     * Returns {@code true} when the device has both available back and front cameras. Otherwise,
+     * returns {@code false}.
+     */
+    private boolean canToggleCamera() {
+        if (mLocalFgService == null) {
+            return false;
+        }
+
+        List<CameraId> availableCameraIds = mLocalFgService.getAvailableCameraIds();
+        boolean hasBackCamera = false;
+        boolean hasFrontCamera = false;
+
+        for (CameraId cameraId : availableCameraIds) {
+            CameraInfo cameraInfo = mLocalFgService.getOrCreateCameraInfo(cameraId);
+            if (cameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_BACK) {
+                hasBackCamera = true;
+            } else if (cameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
+                hasFrontCamera = true;
+            }
+        }
+
+        return hasBackCamera && hasFrontCamera;
+    }
+
+    private void setToggleCameraContentDescription() {
+        if (mLocalFgService == null) {
+            return;
+        }
+        int lensFacing = mLocalFgService.getCameraInfo().getLensFacing();
+        CharSequence descr = getText(R.string.toggle_camera_button_description_front);
+        if (lensFacing == CameraMetadata.LENS_FACING_FRONT) {
+            descr = getText(R.string.toggle_camera_button_description_back);
+        }
+        mToggleCameraButton.setContentDescription(descr);
     }
 
     private void toggleCamera() {
@@ -422,6 +625,24 @@ public class DeviceAsWebcamPreview extends Activity {
         }
 
         mLocalFgService.toggleCamera();
+        setToggleCameraContentDescription();
+        mFocusIndicator.setVisibility(View.GONE);
+        mMotionEventToZoomRatioConverter.reset(mLocalFgService.getZoomRatio(),
+                mLocalFgService.getCameraInfo().getZoomRatioRange());
+        setupZoomRatioSeekBar();
+        mZoomController.setZoomRatio(mLocalFgService.getZoomRatio(),
+                ZoomController.ZOOM_UI_TOGGLE_MODE);
+        mSwitchCameraSelectorView.updateSelectedItem(
+                mLocalFgService.getCameraInfo().getCameraId());
+    }
+
+    private void switchCamera(CameraId cameraId) {
+        if (mLocalFgService == null) {
+            return;
+        }
+
+        mLocalFgService.switchCamera(cameraId);
+        setToggleCameraContentDescription();
         mMotionEventToZoomRatioConverter.reset(mLocalFgService.getZoomRatio(),
                 mLocalFgService.getCameraInfo().getZoomRatioRange());
         setupZoomRatioSeekBar();
@@ -435,16 +656,40 @@ public class DeviceAsWebcamPreview extends Activity {
         }
 
         float[] normalizedPoint = calculateNormalizedPoint(motionEvent);
-        showFocusIndicatorWithAutoHide(normalizedPoint);
-        MeteringRectangle meteringRectangle = calculateMeteringRectangle(normalizedPoint);
 
-        if (meteringRectangle == null) {
+        if (isTapToResetAutoFocus(normalizedPoint)) {
+            mFocusIndicator.setVisibility(View.GONE);
+            mLocalFgService.resetToAutoFocus();
+        } else {
+            showFocusIndicator(normalizedPoint);
+            mLocalFgService.tapToFocus(normalizedPoint);
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns whether the new points overlap with the original tap-to-focus points or not.
+     */
+    private boolean isTapToResetAutoFocus(float[] newNormalizedPoints) {
+        float[] oldNormalizedPoints = mLocalFgService.getTapToFocusPoints();
+
+        if (oldNormalizedPoints == null) {
             return false;
         }
 
-        mLocalFgService.tapToFocus(new MeteringRectangle[]{meteringRectangle});
+        // Calculates the distance between the new and old points
+        float distanceX = Math.abs(newNormalizedPoints[1] - oldNormalizedPoints[1])
+                * mTextureViewCard.getWidth();
+        float distanceY = Math.abs(newNormalizedPoints[0] - oldNormalizedPoints[0])
+                * mTextureViewCard.getHeight();
+        double distance = Math.sqrt(distanceX*distanceX + distanceY*distanceY);
 
-        return true;
+        int indicatorRadius = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size)
+                / 2;
+
+        // Checks whether the distance is less than the circle radius of focus indicator
+        return indicatorRadius >= distance;
     }
 
     /**
@@ -457,54 +702,51 @@ public class DeviceAsWebcamPreview extends Activity {
     }
 
     /**
-     * Calculates the metering rectangle according to the normalized point.
-     */
-    private MeteringRectangle calculateMeteringRectangle(float[] normalizedPoint) {
-        CameraInfo cameraInfo = mLocalFgService.getCameraInfo();
-        Rect activeArraySize = cameraInfo.getActiveArraySize();
-        float halfMeteringRectWidth = (METERING_RECTANGLE_SIZE * activeArraySize.width()) / 2;
-        float halfMeteringRectHeight = (METERING_RECTANGLE_SIZE * activeArraySize.height()) / 2;
-
-        Matrix matrix = new Matrix();
-        matrix.postRotate(-cameraInfo.getSensorOrientation(), 0.5f, 0.5f);
-        // Flips if current working camera is front camera
-        if (cameraInfo.getLensFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
-            matrix.postScale(1, -1, 0.5f, 0.5f);
-        }
-        matrix.postScale(activeArraySize.width(), activeArraySize.height());
-        matrix.mapPoints(normalizedPoint);
-
-        Rect meteringRegion = new Rect(
-                clamp((int) (normalizedPoint[0] - halfMeteringRectWidth), 0,
-                        activeArraySize.width()),
-                clamp((int) (normalizedPoint[1] - halfMeteringRectHeight), 0,
-                        activeArraySize.height()),
-                clamp((int) (normalizedPoint[0] + halfMeteringRectWidth), 0,
-                        activeArraySize.width()),
-                clamp((int) (normalizedPoint[1] + halfMeteringRectHeight), 0,
-                        activeArraySize.height())
-        );
-
-        return new MeteringRectangle(meteringRegion, MeteringRectangle.METERING_WEIGHT_MAX);
-    }
-
-    /**
      * Show the focus indicator and hide it automatically after a proper duration.
      */
-    private void showFocusIndicatorWithAutoHide(float[] normalizedPoint) {
-        mFocusIndicator.setVisibility(View.VISIBLE);
+    private void showFocusIndicator(float[] normalizedPoint) {
+        int indicatorSize = getResources().getDimensionPixelSize(R.dimen.focus_indicator_size);
         float translationX =
-                normalizedPoint[0] * mTextureViewCard.getWidth() - mFocusIndicator.getWidth() / 2f;
+                normalizedPoint[0] * mTextureViewCard.getWidth() - indicatorSize / 2f;
         float translationY = normalizedPoint[1] * mTextureViewCard.getHeight()
-                - mFocusIndicator.getHeight() / 2f;
+                - indicatorSize / 2f;
         mFocusIndicator.setTranslationX(translationX);
         mFocusIndicator.setTranslationY(translationY);
-        getMainThreadHandler().removeCallbacks(mAutoHideFocusIndicator);
-        getMainThreadHandler().postDelayed(mAutoHideFocusIndicator,
-                FOCUS_INDICATOR_AUTO_HIDE_DURATION_MS);
+        mFocusIndicator.setVisibility(View.VISIBLE);
     }
 
-    private int clamp(int value, int min, int max) {
-        return Math.min(Math.max(value, min), max);
+    private List<SelectorListItemData> createSelectorItemDataList() {
+        List<SelectorListItemData> selectorItemDataList = new ArrayList<>();
+        addSelectorItemDataByLensFacing(selectorItemDataList,
+                CameraCharacteristics.LENS_FACING_BACK);
+        addSelectorItemDataByLensFacing(selectorItemDataList,
+                CameraCharacteristics.LENS_FACING_FRONT);
+
+        return selectorItemDataList;
+    }
+
+    private void addSelectorItemDataByLensFacing(List<SelectorListItemData> selectorItemDataList,
+            int targetLensFacing) {
+        if (mLocalFgService == null) {
+            return;
+        }
+
+        boolean lensFacingHeaderAdded = false;
+
+        for (CameraId cameraId : mLocalFgService.getAvailableCameraIds()) {
+            CameraInfo cameraInfo = mLocalFgService.getOrCreateCameraInfo(cameraId);
+
+            if (cameraInfo.getLensFacing() == targetLensFacing) {
+                if (!lensFacingHeaderAdded) {
+                    selectorItemDataList.add(
+                            SelectorListItemData.createHeaderItemData(targetLensFacing));
+                    lensFacingHeaderAdded = true;
+                }
+
+                selectorItemDataList.add(SelectorListItemData.createCameraItemData(
+                        cameraInfo));
+            }
+
+        }
     }
 }

@@ -19,30 +19,38 @@ package com.android.DeviceAsWebcam;
 import android.graphics.Rect;
 import android.util.Range;
 
-import java.util.List;
-
 /**
  * A class for providing camera related information.
  */
 public class CameraInfo {
+    private final CameraId mCameraId;
     private final int mLensFacing;
     private final int mSensorOrientation;
     private final Range<Float> mZoomRatioRange;
-    private final List<VendorCameraPrefs.PhysicalCameraInfo> mPhysicalCameraInfos;
     private final Rect mActiveArraySize;
     private final boolean mFacePrioritySupported;
     private final boolean mIsStreamUseCaseSupported;
+    private final CameraCategory mCameraCategory;
 
-    public CameraInfo(int lensFacing, int sensorOrientation, Range<Float> zoomRatioRange,
-            List<VendorCameraPrefs.PhysicalCameraInfo> physicalInfos, Rect activeArraySize,
-            boolean facePrioritySupported, boolean streamUseCaseSupported) {
+    public CameraInfo(CameraId cameraId, int lensFacing,
+            int sensorOrientation, Range<Float> zoomRatioRange, Rect activeArraySize,
+            boolean facePrioritySupported, boolean streamUseCaseSupported,
+            CameraCategory cameraCategory) {
+        mCameraId = cameraId;
         mLensFacing = lensFacing;
         mSensorOrientation = sensorOrientation;
         mZoomRatioRange = zoomRatioRange;
-        mPhysicalCameraInfos = physicalInfos;
         mActiveArraySize = activeArraySize;
         mFacePrioritySupported = facePrioritySupported;
         mIsStreamUseCaseSupported = streamUseCaseSupported;
+        mCameraCategory = cameraCategory;
+    }
+
+    /**
+     * Returns the CameraId.
+     */
+    public CameraId getCameraId() {
+        return mCameraId;
     }
 
     /**
@@ -66,10 +74,6 @@ public class CameraInfo {
         return mZoomRatioRange;
     }
 
-    public List<VendorCameraPrefs.PhysicalCameraInfo> getPhysicalCameraInfos() {
-        return mPhysicalCameraInfos;
-    }
-
     /**
      * Returns active array size characteristics value.
      */
@@ -91,4 +95,10 @@ public class CameraInfo {
         return mIsStreamUseCaseSupported;
     }
 
+    /**
+     * Returns camera category.
+     */
+    public CameraCategory getCameraCategory() {
+        return mCameraCategory;
+    }
 }
