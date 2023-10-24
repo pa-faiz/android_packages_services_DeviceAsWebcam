@@ -24,6 +24,7 @@ import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.accessibility.AccessibilityEvent;
 import android.view.animation.AccelerateDecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.SeekBar;
@@ -44,7 +45,6 @@ import java.text.DecimalFormat;
  * A custom zoom controller to allow users to adjust their preferred zoom ratio setting.
  */
 public class ZoomController extends FrameLayout {
-
     /**
      * Zoom UI toggle mode.
      */
@@ -61,6 +61,7 @@ public class ZoomController extends FrameLayout {
      * The toggle UI auto-show duration in ms.
      */
     private static final int TOGGLE_UI_AUTO_SHOW_DURATION_MS = 1000;
+    private static final int TOGGLE_UI_AUTO_SHOW_DURATION_ACCESSIBILITY_MS = 7000;
     /**
      * The invalid x position used when translating the motion events to the seek bar progress.
      */
@@ -70,11 +71,11 @@ public class ZoomController extends FrameLayout {
      */
     private int mZoomUiMode = ZOOM_UI_TOGGLE_MODE;
     private View mToggleUiOptions;
+    private View mTouchOverlay;
     private View mToggleUiBackground;
     private View mToggleButtonSelected;
     private SeekBar mSeekBar;
     private ZoomKnob mZoomKnob;
-    private View mToggleOptionLowSideSpace;
     /**
      * TextView of the low sticky zoom ratio value option item.
      */
@@ -127,13 +128,21 @@ public class ZoomController extends FrameLayout {
      * Current toggle option count.
      */
     private int mToggleOptionCount = 3;
-    private Runnable mToggleUiAutoShowRunnable;
+    private final Runnable mToggleUiAutoShowRunnable = () -> switchZoomUiMode(ZOOM_UI_TOGGLE_MODE);
     /**
      * The registered zoom ratio updated listener.
      */
     private OnZoomRatioUpdatedListener mOnZoomRatioUpdatedListener = null;
     private boolean mFirstPositionSkipped = false;
     private float mPreviousXPosition = INVALID_X_POSITION;
+
+    /**
+     * Timeout for toggling between slider and buttons. This is
+     * {@link #TOGGLE_UI_AUTO_SHOW_DURATION_MS} normally, and increases to
+     * {@link #TOGGLE_UI_AUTO_SHOW_DURATION_ACCESSIBILITY_MS} when accessibility services are
+     * enabled.
+     */
+    private int mToggleAutoShowDurationMs = TOGGLE_UI_AUTO_SHOW_DURATION_MS;
 
     public ZoomController(@NonNull Context context, @Nullable AttributeSet attrs,
             int defStyleAttr) {
@@ -159,6 +168,7 @@ public class ZoomController extends FrameLayout {
         addView(layoutInflater.inflate(R.layout.zoom_controller, null));
 
         mToggleUiOptions = findViewById(R.id.zoom_ui_toggle_options);
+        mTouchOverlay = findViewById(R.id.zoom_ui_overlay);
         mToggleUiBackground = findViewById(R.id.zoom_ui_toggle_background);
         mToggleButtonSelected = findViewById(R.id.zoom_ui_toggle_btn_selected);
         mSeekBar = findViewById(R.id.zoom_ui_seekbar_slider);
@@ -166,7 +176,6 @@ public class ZoomController extends FrameLayout {
         mToggleOptionLow = findViewById(R.id.zoom_ui_toggle_option_low);
         mToggleOptionMiddle = findViewById(R.id.zoom_ui_toggle_option_middle);
         mToggleOptionHigh = findViewById(R.id.zoom_ui_toggle_option_high);
-        mToggleOptionLowSideSpace = findViewById(R.id.zoom_ui_toggle_option_low_side_space);
 
         switchZoomUiMode(mZoomUiMode);
 
@@ -175,18 +184,36 @@ public class ZoomController extends FrameLayout {
         setSupportedZoomRatioRange(zoomRatioRange);
 
         // Monitors the touch events on the toggle UI to update the zoom ratio value.
-        mToggleUiOptions.setOnTouchListener((v, event) -> {
+        mTouchOverlay.setOnTouchListener((v, event) -> {
             if (mZoomUiMode == ZOOM_UI_TOGGLE_MODE) {
                 updateSelectedZoomToggleOptionByMotionEvent(event);
             } else {
                 updateSeekBarProgressByMotionEvent(event);
             }
-
             return false;
         });
 
+        mTouchOverlay.setOnClickListener(v -> {
+            // Empty click listener to ensure none of the elements underneath
+            // the overlay receive an event.
+        });
         // Long click events will trigger to switch the zoom ui mode
+        mTouchOverlay.setOnLongClickListener(v -> {
+            switchZoomUiMode(ZOOM_UI_SEEK_BAR_MODE);
+            return false;
+        });
+
+        mToggleOptionLow.setOnClickListener((v) ->
+                setToggleUiZoomRatio(mCurrentLowStickyZoomRatio, 0));
+        mToggleOptionMiddle.setOnClickListener((v) ->
+                setToggleUiZoomRatio(mCurrentMiddleStickyZoomRatio, 1));
+        mToggleOptionHigh.setOnClickListener((v) ->
+                setToggleUiZoomRatio(mCurrentHighStickyZoomRatio, 2));
+
         mToggleUiOptions.setOnLongClickListener(v -> switchZoomUiMode(ZOOM_UI_SEEK_BAR_MODE));
+        mToggleOptionLow.setOnLongClickListener(v -> switchZoomUiMode(ZOOM_UI_SEEK_BAR_MODE));
+        mToggleOptionMiddle.setOnLongClickListener(v -> switchZoomUiMode(ZOOM_UI_SEEK_BAR_MODE));
+        mToggleOptionHigh.setOnLongClickListener(v -> switchZoomUiMode(ZOOM_UI_SEEK_BAR_MODE));
 
         mSeekBar.setOnSeekBarChangeListener(
                 new OnSeekBarChangeListener() {
@@ -197,6 +224,7 @@ public class ZoomController extends FrameLayout {
                         }
                         updateZoomKnobByProgress(progress);
                         setZoomRatioInternal(convertProgressToZoomRatio(progress), true);
+                        resetToggleUiAutoShowRunnable();
                     }
 
                     @Override
@@ -212,6 +240,17 @@ public class ZoomController extends FrameLayout {
                     }
                 }
         );
+    }
+
+    @Override
+    public void setEnabled(boolean enabled) {
+        super.setEnabled(enabled);
+        // Force disable these controls so that AccessibilityTraversalAfter won't take effects on
+        // these controls when they are disabled.
+        mToggleUiOptions.setEnabled(enabled);
+        mToggleOptionLow.setEnabled(enabled);
+        mToggleOptionMiddle.setEnabled(enabled);
+        mToggleOptionHigh.setEnabled(enabled);
     }
 
     /**
@@ -342,7 +381,6 @@ public class ZoomController extends FrameLayout {
         updateZoomKnobByZoomRatio(zoomRatio);
         mSeekBar.setProgress(convertZoomRatioToProgress(zoomRatio));
         switchZoomUiMode(zoomUiMode);
-        mSeekBar.setEnabled(zoomUiMode == ZOOM_UI_SEEK_BAR_MODE);
         resetToggleUiAutoShowRunnable();
     }
 
@@ -359,8 +397,18 @@ public class ZoomController extends FrameLayout {
             mOnZoomRatioUpdatedListener.onValueChanged(roundedZoomRatio);
         }
 
+        boolean sendAccessibilityEvent = roundedZoomRatio != mCurrentZoomRatio &&
+                                         (int)
+                                            (Math.floor(roundedZoomRatio) -
+                                                Math.floor(mCurrentZoomRatio)) != 0;
+
         mCurrentZoomRatio = roundedZoomRatio;
         updateToggleOptionValues();
+        mSeekBar.setStateDescription(Float.toString(mCurrentZoomRatio));
+        mToggleUiOptions.setStateDescription(Float.toString(mCurrentZoomRatio));
+        if (sendAccessibilityEvent) {
+            mSeekBar.sendAccessibilityEvent(AccessibilityEvent.CONTENT_CHANGE_TYPE_TEXT);
+        }
     }
 
     /**
@@ -368,6 +416,30 @@ public class ZoomController extends FrameLayout {
      */
     public void setOnZoomRatioUpdatedListener(OnZoomRatioUpdatedListener listener) {
         mOnZoomRatioUpdatedListener = listener;
+    }
+
+    /**
+     * Method to be called if Accessibility Services are enabled/disabled. This should
+     * be called by the parent activity/fragment to ensure that ZoomController is more
+     * more functional when used with Accessibility Services.
+     *
+     * @param enabled whether accessibility services are enabled or not
+     */
+    public void onAccessibilityServicesEnabled(boolean enabled) {
+        if (mTouchOverlay == null) {
+            return;
+        }
+
+        // Hide the overlay as touch events don't work well with Accessibility Services
+        // When Accessibility Services are enabled, we provide a somewhat less refined,
+        // but more accessible UX flow for changing zoom.
+        if (enabled) {
+            mTouchOverlay.setVisibility(View.GONE);
+            mToggleAutoShowDurationMs = TOGGLE_UI_AUTO_SHOW_DURATION_ACCESSIBILITY_MS;
+        } else {
+            mTouchOverlay.setVisibility(View.VISIBLE);
+            mToggleAutoShowDurationMs = TOGGLE_UI_AUTO_SHOW_DURATION_MS;
+        }
     }
 
     /**
@@ -403,10 +475,6 @@ public class ZoomController extends FrameLayout {
         mSeekBar.setVisibility(seekBarUiVisibility);
         mZoomKnob.setVisibility(seekBarUiVisibility);
 
-        if (zoomUiMode == ZOOM_UI_TOGGLE_MODE) {
-            mSeekBar.setEnabled(false);
-        }
-
         return false;
     }
 
@@ -426,14 +494,12 @@ public class ZoomController extends FrameLayout {
             case 2 -> {
                 layoutWidth = getResources().getDimensionPixelSize(
                         R.dimen.zoom_ui_toggle_two_options_layout_width);
-                mToggleOptionLowSideSpace.setVisibility(View.GONE);
                 mToggleOptionMiddle.setVisibility(View.GONE);
                 setSelectedZoomToggleOption(0);
             }
             case 3 -> {
                 layoutWidth = getResources().getDimensionPixelSize(
                         R.dimen.zoom_ui_toggle_three_options_layout_width);
-                mToggleOptionLowSideSpace.setVisibility(View.VISIBLE);
                 mToggleOptionMiddle.setVisibility(View.VISIBLE);
                 setSelectedZoomToggleOption(1);
             }
@@ -455,25 +521,33 @@ public class ZoomController extends FrameLayout {
      * <p>Mark the toggle option as selected when the motion event is in their own layout range.
      */
     private void updateSelectedZoomToggleOptionByMotionEvent(MotionEvent event) {
-        int zoomToggleUiWidth = mToggleUiOptions.getWidth();
         float updatedZoomRatio;
+        int toggleOption;
+
+        int zoomToggleUiWidth = mToggleUiOptions.getWidth();
         if (event.getX() <= zoomToggleUiWidth / mToggleOptionCount) {
-            setSelectedZoomToggleOption(0);
+            toggleOption = 0;
             updatedZoomRatio = mCurrentLowStickyZoomRatio;
         } else if (event.getX()
                 > zoomToggleUiWidth * (mToggleOptionCount - 1) / mToggleOptionCount) {
-            setSelectedZoomToggleOption(2);
+            toggleOption = 2;
             updatedZoomRatio = mCurrentHighStickyZoomRatio;
         } else {
-            setSelectedZoomToggleOption(1);
+            toggleOption = 1;
             updatedZoomRatio = mCurrentMiddleStickyZoomRatio;
         }
 
+        setToggleUiZoomRatio(updatedZoomRatio, toggleOption);
+    }
+
+    private void setToggleUiZoomRatio(float currentStickyZoomRatio,
+                                      int currentZoomToggleOption) {
+        setSelectedZoomToggleOption(currentZoomToggleOption);
         // Updates the knob seek bar and zoom ratio value according to the newly selected option.
-        if (updatedZoomRatio != mCurrentZoomRatio) {
-            updateZoomKnobByZoomRatio(updatedZoomRatio);
-            mSeekBar.setProgress(convertZoomRatioToProgress(updatedZoomRatio));
-            setZoomRatioInternal(updatedZoomRatio, true);
+        if (currentStickyZoomRatio != mCurrentZoomRatio) {
+            updateZoomKnobByZoomRatio(currentStickyZoomRatio);
+            mSeekBar.setProgress(convertZoomRatioToProgress(currentStickyZoomRatio));
+            setZoomRatioInternal(currentStickyZoomRatio, true);
         }
     }
 
@@ -481,24 +555,32 @@ public class ZoomController extends FrameLayout {
      * Sets the specific zoom toggle option UI as selected.
      */
     private void setSelectedZoomToggleOption(int optionIndex) {
+        mToggleOptionLow.setStateDescription(null);
+        mToggleOptionMiddle.setStateDescription(null);
+        mToggleOptionHigh.setStateDescription(null);
+
+        String stateDesc = mContext.getString(R.string.zoom_ratio_button_current_description);
         LayoutParams lp = (LayoutParams) mToggleButtonSelected.getLayoutParams();
         switch (optionIndex) {
             case 0 -> {
                 lp.leftMargin = getResources().getDimensionPixelSize(
                         R.dimen.zoom_ui_toggle_padding);
                 lp.rightMargin = 0;
-                lp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.LEFT;
+                lp.gravity = Gravity.CENTER_VERTICAL | Gravity.LEFT;
+                mToggleOptionLow.setStateDescription(stateDesc);
             }
             case 1 -> {
                 lp.leftMargin = 0;
                 lp.rightMargin = 0;
-                lp.gravity = Gravity.CENTER_HORIZONTAL;
+                lp.gravity = Gravity.CENTER_VERTICAL | Gravity.CENTER_HORIZONTAL;
+                mToggleOptionMiddle.setStateDescription(stateDesc);
             }
             case 2 -> {
                 lp.leftMargin = 0;
                 lp.rightMargin = getResources().getDimensionPixelSize(
                         R.dimen.zoom_ui_toggle_padding);
-                lp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.RIGHT;
+                lp.gravity = Gravity.CENTER_VERTICAL | Gravity.RIGHT;
+                mToggleOptionHigh.setStateDescription(stateDesc);
             }
             default -> throw new IllegalArgumentException("Unsupported toggle option index!");
         }
@@ -537,7 +619,6 @@ public class ZoomController extends FrameLayout {
             mFirstPositionSkipped = false;
             mPreviousXPosition = INVALID_X_POSITION;
             resetToggleUiAutoShowRunnable();
-            mSeekBar.setEnabled(true);
         } else {
             mPreviousXPosition = event.getX();
         }
@@ -574,28 +655,18 @@ public class ZoomController extends FrameLayout {
     }
 
     /**
-     * Creates a runnable to show the toggle UI.
-     */
-    private Runnable createToggleUiAutoShowRunnable() {
-        return () -> switchZoomUiMode(ZOOM_UI_TOGGLE_MODE);
-    }
-
-    /**
      * Resets the toggle UI auto-show runnable.
      */
     private void resetToggleUiAutoShowRunnable() {
         removeToggleUiAutoShowRunnable();
-        mToggleUiAutoShowRunnable = createToggleUiAutoShowRunnable();
-        postDelayed(mToggleUiAutoShowRunnable, TOGGLE_UI_AUTO_SHOW_DURATION_MS);
+        postDelayed(mToggleUiAutoShowRunnable, mToggleAutoShowDurationMs);
     }
 
     /**
      * Removes the toggle UI auto-show runnable.
      */
     private void removeToggleUiAutoShowRunnable() {
-        if (mToggleUiAutoShowRunnable != null) {
-            removeCallbacks(mToggleUiAutoShowRunnable);
-        }
+        removeCallbacks(mToggleUiAutoShowRunnable);
     }
 
     /**

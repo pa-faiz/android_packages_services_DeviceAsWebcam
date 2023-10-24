@@ -16,7 +16,6 @@
 
 package com.android.DeviceAsWebcam;
 
-import android.annotation.Nullable;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -27,12 +26,12 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
-import android.hardware.camera2.params.MeteringRectangle;
 import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
 import android.util.Size;
 
+import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 
@@ -40,6 +39,7 @@ import com.android.DeviceAsWebcam.annotations.UsedByNative;
 import com.android.DeviceAsWebcam.utils.IgnoredV4L2Nodes;
 
 import java.lang.ref.WeakReference;
+import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
 
@@ -60,10 +60,11 @@ public class DeviceAsWebcamFgService extends Service {
     private CameraController mCameraController;
     private Runnable mDestroyActivityCallback = null;
     private boolean mServiceRunning = false;
+
     private NotificationCompat.Builder mNotificationBuilder;
     private int mNotificationIcon;
-
-
+    private int mNextNotificationIcon;
+    private boolean mNotificationUpdatePending;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -102,7 +103,7 @@ public class DeviceAsWebcamFgService extends Service {
 
     private String createNotificationChannel() {
         NotificationChannel channel = new NotificationChannel(NOTIF_CHANNEL_ID,
-                getString(R.string.notif_channel_name), NotificationManager.IMPORTANCE_LOW);
+                getString(R.string.notif_channel_name), NotificationManager.IMPORTANCE_DEFAULT);
         NotificationManager notMan = getSystemService(NotificationManager.class);
         Objects.requireNonNull(notMan).createNotificationChannel(channel);
         return NOTIF_CHANNEL_ID;
@@ -113,14 +114,15 @@ public class DeviceAsWebcamFgService extends Service {
         PendingIntent pendingIntent = PendingIntent.getActivity(mContext, 0, notificationIntent,
                 PendingIntent.FLAG_MUTABLE);
         String channelId = createNotificationChannel();
-        mNotificationIcon = R.drawable.ic_notif_line;
+        mNextNotificationIcon = mNotificationIcon = R.drawable.ic_notif_line;
         mNotificationBuilder = new NotificationCompat.Builder(this, channelId)
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setContentIntent(pendingIntent)
                 .setContentText(getString(R.string.notif_desc))
                 .setContentTitle(getString(R.string.notif_title))
+                .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
                 .setOngoing(true)
-                .setPriority(NotificationManager.IMPORTANCE_MIN)
+                .setPriority(NotificationManager.IMPORTANCE_DEFAULT)
                 .setShowWhen(false)
                 .setSmallIcon(mNotificationIcon)
                 .setTicker(getString(R.string.notif_ticker))
@@ -148,6 +150,8 @@ public class DeviceAsWebcamFgService extends Service {
             if (VERBOSE) {
                 Log.v(TAG, "Destroyed fg service");
             }
+            // Ensure that the service notification is removed.
+            NotificationManagerCompat.from(mContext).cancelAll();
         }
         super.onDestroy();
     }
@@ -238,6 +242,34 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     /**
+     * Returns the available {@link CameraId} list.
+     */
+    @Nullable
+    public List<CameraId> getAvailableCameraIds() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "getAvailableCameraIds called after Service was destroyed.");
+                return null;
+            }
+            return mCameraController.getAvailableCameraIds();
+        }
+    }
+
+    /**
+     * Returns the {@link CameraInfo} for the specified camera id.
+     */
+    @Nullable
+    public CameraInfo getOrCreateCameraInfo(CameraId cameraId) {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "getCameraInfo called after Service was destroyed.");
+                return null;
+            }
+            return mCameraController.getOrCreateCameraInfo(cameraId);
+        }
+    }
+
+    /**
      * Sets the new zoom ratio setting to the working camera.
      */
     public void setZoomRatio(float zoomRatio) {
@@ -264,22 +296,6 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     /**
-     * Returns whether the device can support toggle camera function.
-     *
-     * @return {@code true} if the device has both back and front cameras. Otherwise, returns
-     * {@code false}.
-     */
-    public boolean canToggleCamera() {
-        synchronized (mServiceLock) {
-            if (!mServiceRunning) {
-                Log.e(TAG, "canToggleCamera called after Service was destroyed.");
-                return false;
-            }
-            return mCameraController.canToggleCamera();
-        }
-    }
-
-    /**
      * Toggles camera between the back and front cameras.
      */
     public void toggleCamera() {
@@ -289,6 +305,19 @@ public class DeviceAsWebcamFgService extends Service {
                 return;
             }
             mCameraController.toggleCamera();
+        }
+    }
+
+    /**
+     * Switches current working camera to specific one.
+     */
+    public void switchCamera(CameraId cameraId) {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "switchCamera called after Service was destroyed.");
+                return;
+            }
+            mCameraController.switchCamera(cameraId);
         }
     }
 
@@ -320,25 +349,70 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     private void updateNotification(boolean isStreaming) {
-        int icon; // animated icon
+        int transitionIcon; // animated icon
+        int finalIcon; // static icon
         if (isStreaming) {
-            icon = R.drawable.ic_notif_streaming;
+            transitionIcon = R.drawable.ic_notif_streaming;
             // last frame of ic_notif_streaming
-            mNotificationIcon = R.drawable.ic_notif_filled;
+            finalIcon = R.drawable.ic_notif_filled;
         } else {
-            icon = R.drawable.ic_notif_idle;
+            transitionIcon = R.drawable.ic_notif_idle;
             // last frame of ic_notif_idle
-            mNotificationIcon = R.drawable.ic_notif_line;
+            finalIcon = R.drawable.ic_notif_line;
         }
-        mNotificationBuilder.setSmallIcon(icon);
-        NotificationManagerCompat.from(mContext).notify(NOTIF_ID, mNotificationBuilder.build());
 
-        // Update notification after 1s to make the last frame sticky. This prevents the animation
-        // from re-running if the notification icon is redrawn.
-        getMainThreadHandler().postDelayed(() -> {
-            mNotificationBuilder.setSmallIcon(mNotificationIcon);
+        synchronized (mServiceLock) {
+            if (finalIcon == mNotificationIcon) {
+                // Notification already is desired state.
+                return;
+            }
+            if (transitionIcon == mNotificationIcon) {
+                // Notification currently animating to finalIcon.
+                // Set next state to desired steady state icon.
+                mNextNotificationIcon = finalIcon;
+                return;
+            }
+
+            if (mNotificationUpdatePending) {
+                // Notification animating to some other icon. Set the next icon to the new
+                // transition icon and let the update runnable handle the actual updates.
+                mNextNotificationIcon = transitionIcon;
+                return;
+            }
+
+            // Notification is in a steady state. Update notification to the new icon.
+            mNextNotificationIcon = transitionIcon;
+            updateNotificationToNextIcon();
+        }
+    }
+
+    private void updateNotificationToNextIcon() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                return;
+            }
+
+            mNotificationBuilder.setSmallIcon(mNextNotificationIcon);
             NotificationManagerCompat.from(mContext).notify(NOTIF_ID, mNotificationBuilder.build());
-        }, 500);
+            mNotificationIcon = mNextNotificationIcon;
+
+            boolean notifNeedsUpdate = false;
+            if (mNotificationIcon == R.drawable.ic_notif_streaming) {
+                // last frame of ic_notif_streaming
+                mNextNotificationIcon = R.drawable.ic_notif_filled;
+                notifNeedsUpdate = true;
+            } else if (mNotificationIcon == R.drawable.ic_notif_idle) {
+                // last frame of ic_notif_idle
+                mNextNotificationIcon = R.drawable.ic_notif_line;
+                notifNeedsUpdate = true;
+            }
+            mNotificationUpdatePending = notifNeedsUpdate;
+            if (notifNeedsUpdate) {
+                // Run this method again after 500ms to update the notification to steady
+                // state icon
+                getMainThreadHandler().postDelayed(this::updateNotificationToNextIcon, 500);
+            }
+        }
     }
 
     @UsedByNative("DeviceAsWebcamNative.cpp")
@@ -399,15 +473,46 @@ public class DeviceAsWebcamFgService extends Service {
     }
 
     /**
-     * Trigger tap-to-focus operation for the specified metering rectangles.
+     * Trigger tap-to-focus operation for the specified normalized points mapping to the FOV.
+     *
+     * <p>The specified normalized points will be used to calculate the corresponding metering
+     * rectangles that will be applied for AF, AE and AWB.
      */
-    public void tapToFocus(MeteringRectangle[] meteringRectangles) {
+    public void tapToFocus(float[] normalizedPoint) {
         synchronized (mServiceLock) {
             if (!mServiceRunning) {
                 Log.e(TAG, "tapToFocus was called after Service was destroyed");
                 return;
             }
-            mCameraController.tapToFocus(meteringRectangles);
+            mCameraController.tapToFocus(normalizedPoint);
+        }
+    }
+
+    /**
+     * Retrieves current tap-to-focus points.
+     *
+     * @return the normalized points or {@code null} if it is auto-focus mode currently.
+     */
+    public float[] getTapToFocusPoints() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "getTapToFocusPoints was called after Service was destroyed");
+                return null;
+            }
+            return mCameraController.getTapToFocusPoints();
+        }
+    }
+
+    /**
+     * Resets to the auto-focus mode.
+     */
+    public void resetToAutoFocus() {
+        synchronized (mServiceLock) {
+            if (!mServiceRunning) {
+                Log.e(TAG, "resetToAutoFocus was called after Service was destroyed");
+                return;
+            }
+            mCameraController.resetToAutoFocus();
         }
     }
 
