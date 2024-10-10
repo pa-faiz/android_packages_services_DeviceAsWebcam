@@ -8,6 +8,7 @@ cc_library_shared {
     stl: "c++_static",
     shared_libs: [
         "libandroid",
+        "libbase",
         "libjpeg",
         "liblog",
         "libmediandk",

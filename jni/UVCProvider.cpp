@@ -33,12 +33,16 @@
 #include <SdkFrameProvider.h>
 #include <UVCProvider.h>
 #include <Utils.h>
+#include <android-base/properties.h>
 #include <log/log.h>
+
+using android::base::GetUintProperty;
 
 constexpr int MAX_EVENTS = 10;
 constexpr uint32_t NUM_BUFFERS_ALLOC = 4;
 constexpr uint32_t USB_PAYLOAD_TRANSFER_SIZE = 3072;
 constexpr char kDeviceGlobPattern[] = "/dev/video*";
+constexpr char kUsbPayloadTransferSizeProperty[] = "ro.usb.uvc.payload_transfer_size";
 
 // Taken from UVC UAPI. The kernel handles mapping these back to actual USB interfaces set up by the
 // UVC gadget function.
@@ -512,7 +516,19 @@ void UVCProvider::UVCDevice::setStreamingControl(struct uvc_streaming_control* s
     streamingControl->bFormatIndex = chosenFormatIndex;
     streamingControl->bFrameIndex = chosenFrameIndex;
     streamingControl->dwFrameInterval = reqFrameInterval;
-    streamingControl->dwMaxPayloadTransferSize = USB_PAYLOAD_TRANSFER_SIZE;
+    streamingControl->dwMaxPayloadTransferSize = GetUintProperty(kUsbPayloadTransferSizeProperty,
+                                                                 USB_PAYLOAD_TRANSFER_SIZE);
+    switch (streamingControl->dwMaxPayloadTransferSize) {
+        case 1024:
+        case 2048:
+        case 3072:
+            break;
+        default:
+            ALOGE("%s Invalid dwMaxPayloadTransferSize from property: %d",
+                  __FUNCTION__, streamingControl->dwMaxPayloadTransferSize);
+            streamingControl->dwMaxPayloadTransferSize = USB_PAYLOAD_TRANSFER_SIZE;
+            break;
+    }
     switch (chosenFormat.fcc) {
         case V4L2_PIX_FMT_YUYV:
         case V4L2_PIX_FMT_MJPEG:
